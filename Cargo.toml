@@ -1,0 +1,18 @@
+[package]
+name = "equity-matching-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic synthetic equity limit-order matching engine"
+license = "MIT"
+
+[lib]
+name = "equity_matching_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "equity-matching-engine"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
