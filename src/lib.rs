@@ -1,5 +1,6 @@
 //! Deterministic, single-threaded price-time-priority matching for synthetic orders.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 pub type OrderId = u64;
@@ -7,13 +8,15 @@ pub type Sequence = u64;
 pub type PriceTicks = i64;
 pub type QuantityLots = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub mod eventlog;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
     Buy,
     Sell,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub order_id: OrderId,
     pub side: Side,
@@ -252,6 +255,41 @@ impl MatchingEngine {
     }
     pub fn live_order_count(&self) -> usize {
         self.live_orders.len()
+    }
+
+    /// Stable FNV-1a fingerprint of all state that can affect later commands.
+    pub fn state_fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf29ce484222325_u64;
+        fn add(hash: &mut u64, bytes: &[u8]) {
+            for byte in bytes {
+                *hash ^= u64::from(*byte);
+                *hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        add(&mut hash, &self.next_sequence.to_le_bytes());
+        for (side, book) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
+            add(
+                &mut hash,
+                &[match side {
+                    Side::Buy => 0,
+                    Side::Sell => 1,
+                }],
+            );
+            for (price, orders) in book {
+                add(&mut hash, &price.to_le_bytes());
+                for order in orders {
+                    add(&mut hash, &order.order_id.to_le_bytes());
+                    add(&mut hash, &order.remaining_lots.to_le_bytes());
+                    add(&mut hash, &order.sequence.to_le_bytes());
+                }
+            }
+        }
+        let mut used_ids: Vec<_> = self.used_order_ids.iter().copied().collect();
+        used_ids.sort_unstable();
+        for order_id in used_ids {
+            add(&mut hash, &order_id.to_le_bytes());
+        }
+        hash
     }
 
     /// Check book/index agreement, nonzero quantities, and absence of crossed resting prices.
