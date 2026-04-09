@@ -8,6 +8,7 @@ pub type Sequence = u64;
 pub type PriceTicks = i64;
 pub type QuantityLots = u64;
 
+pub mod benchmark;
 pub mod eventlog;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +256,10 @@ impl MatchingEngine {
     }
     pub fn live_order_count(&self) -> usize {
         self.live_orders.len()
+    }
+
+    pub fn contains_live_order(&self, order_id: OrderId) -> bool {
+        self.live_orders.contains_key(&order_id)
     }
 
     /// Stable FNV-1a fingerprint of all state that can affect later commands.

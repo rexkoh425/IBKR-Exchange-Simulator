@@ -16,6 +16,15 @@ Prices are integer ticks and quantities are integer lots. Each accepted submit
 or cancel advances a local sequence. A replacement requires a fresh order ID so
 that the new order receives no inherited queue priority.
 
+## Synthetic matcher benchmark
+
+Run `cargo run --release -- benchmark --events 1000000 --seed 2026 --trials 5`
+to generate a deterministic mixed submit/cancel workload before timing the
+matcher. It runs a warm-up, then emits one CSV row per measured trial. The
+output reports commands/s, per-command p50/p95/p99 and maximum service time,
+and the final state fingerprint. Timing includes per-command clock reads. This
+isolated matcher harness is not an open-loop queue or broker-feed measurement.
+
 ## Event log and replay
 
 `eventlog` provides schema-versioned JSONL records for synthetic submit/cancel
@@ -26,6 +35,6 @@ the engine state needed for future commands; it is not a cryptographic digest.
 
 ## Project status
 
-This repository is being implemented in phases. Market-data ingestion, strategy
-research, and reproducible load benchmarks are not yet implemented. No live
+This repository is being implemented in phases. Market-data ingestion and
+strategy research are not yet implemented. No live
 market data, broker connectivity, or performance results are claimed.
