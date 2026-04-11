@@ -1,7 +1,7 @@
 //! Deterministic, single-threaded price-time-priority matching for synthetic orders.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub type OrderId = u64;
 pub type Sequence = u64;
@@ -80,10 +80,27 @@ pub struct ReplaceResult {
 }
 
 #[derive(Debug, Default)]
+struct PriceLevel {
+    head: Option<OrderId>,
+    tail: Option<OrderId>,
+    total_quantity: QuantityLots,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveOrder {
+    side: Side,
+    price_ticks: PriceTicks,
+    remaining_lots: QuantityLots,
+    sequence: Sequence,
+    previous: Option<OrderId>,
+    next: Option<OrderId>,
+}
+
+#[derive(Debug, Default)]
 pub struct MatchingEngine {
-    bids: BTreeMap<PriceTicks, VecDeque<RestingOrder>>,
-    asks: BTreeMap<PriceTicks, VecDeque<RestingOrder>>,
-    live_orders: HashMap<OrderId, (Side, PriceTicks)>,
+    bids: BTreeMap<PriceTicks, PriceLevel>,
+    asks: BTreeMap<PriceTicks, PriceLevel>,
+    live_orders: HashMap<OrderId, LiveOrder>,
     used_order_ids: HashSet<OrderId>,
     next_sequence: Sequence,
 }
@@ -129,30 +146,37 @@ impl MatchingEngine {
             let Some(price) = best_price else { break };
             // Borrow the selected side's level map and the live index as
             // disjoint fields so completed makers can leave the index here.
-            let (resting_book, live_orders) = match request.side {
-                Side::Buy => (&mut self.asks, &mut self.live_orders),
-                Side::Sell => (&mut self.bids, &mut self.live_orders),
+            let resting_side = match request.side {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
             };
-            let level = resting_book.get_mut(&price).expect("best price exists");
-            let maker = level.front_mut().expect("price level is non-empty");
+            let maker_id = self
+                .book(resting_side)
+                .get(&price)
+                .and_then(|level| level.head)
+                .expect("price level has a first order");
+            let maker = *self.live_orders.get(&maker_id).expect("level head is live");
             let fill_quantity = remaining.min(maker.remaining_lots);
-            maker.remaining_lots -= fill_quantity;
             remaining -= fill_quantity;
             trades.push(Trade {
                 sequence,
-                maker_order_id: maker.order_id,
+                maker_order_id: maker_id,
                 taker_order_id: request.order_id,
                 taker_side: request.side,
                 price_ticks: price,
                 quantity_lots: fill_quantity,
             });
-            if maker.remaining_lots == 0 {
-                let maker_id = maker.order_id;
-                level.pop_front();
-                live_orders.remove(&maker_id);
-            }
-            if level.is_empty() {
-                resting_book.remove(&price);
+            if fill_quantity == maker.remaining_lots {
+                self.unlink_live_order(maker_id);
+            } else {
+                self.live_orders
+                    .get_mut(&maker_id)
+                    .expect("maker remains live")
+                    .remaining_lots -= fill_quantity;
+                self.book_mut(resting_side)
+                    .get_mut(&price)
+                    .expect("price level remains live")
+                    .total_quantity -= fill_quantity;
             }
         }
 
@@ -164,12 +188,7 @@ impl MatchingEngine {
                 remaining_lots: remaining,
                 sequence,
             };
-            self.book_mut(request.side)
-                .entry(request.price_ticks)
-                .or_default()
-                .push_back(order);
-            self.live_orders
-                .insert(request.order_id, (request.side, request.price_ticks));
+            self.insert_live_order(order);
         }
         SubmitResult {
             sequence: Some(sequence),
@@ -181,27 +200,15 @@ impl MatchingEngine {
 
     /// Remove a live order. Rejected cancellations do not advance sequence.
     pub fn cancel(&mut self, order_id: OrderId) -> Result<RestingOrder, RejectReason> {
-        let (side, price) = *self
-            .live_orders
-            .get(&order_id)
-            .ok_or(RejectReason::UnknownOrderId)?;
+        if !self.live_orders.contains_key(&order_id) {
+            return Err(RejectReason::UnknownOrderId);
+        }
         if self.next_sequence == Sequence::MAX {
             return Err(RejectReason::SequenceExhausted);
         }
         self.allocate_sequence()
             .ok_or(RejectReason::SequenceExhausted)?;
-        let book = self.book_mut(side);
-        let level = book.get_mut(&price).expect("live order has a price level");
-        let index = level
-            .iter()
-            .position(|order| order.order_id == order_id)
-            .expect("live order is in price level");
-        let removed = level.remove(index).expect("position was found");
-        if level.is_empty() {
-            book.remove(&price);
-        }
-        self.live_orders.remove(&order_id);
-        Ok(removed)
+        Ok(self.unlink_live_order(order_id))
     }
 
     /// Replace by canceling the old order and submitting a fresh ID without inherited priority.
@@ -233,26 +240,38 @@ impl MatchingEngine {
     }
 
     pub fn best_bid(&self) -> Option<(PriceTicks, QuantityLots)> {
-        self.bids.iter().next_back().map(|(price, orders)| {
-            (
-                *price,
-                orders.iter().map(|order| order.remaining_lots).sum(),
-            )
-        })
+        self.bids
+            .iter()
+            .next_back()
+            .map(|(price, level)| (*price, level.total_quantity))
     }
     pub fn best_ask(&self) -> Option<(PriceTicks, QuantityLots)> {
-        self.asks.iter().next().map(|(price, orders)| {
-            (
-                *price,
-                orders.iter().map(|order| order.remaining_lots).sum(),
-            )
-        })
+        self.asks
+            .iter()
+            .next()
+            .map(|(price, level)| (*price, level.total_quantity))
     }
     pub fn resting_orders(&self, side: Side, price: PriceTicks) -> Vec<RestingOrder> {
-        self.book(side)
-            .get(&price)
-            .map(|orders| orders.iter().copied().collect())
-            .unwrap_or_default()
+        let Some(level) = self.book(side).get(&price) else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        let mut next_id = level.head;
+        while let Some(order_id) = next_id {
+            let order = self
+                .live_orders
+                .get(&order_id)
+                .expect("level points to a live order");
+            result.push(RestingOrder {
+                order_id,
+                side: order.side,
+                price_ticks: order.price_ticks,
+                remaining_lots: order.remaining_lots,
+                sequence: order.sequence,
+            });
+            next_id = order.next;
+        }
+        result
     }
     pub fn live_order_count(&self) -> usize {
         self.live_orders.len()
@@ -280,12 +299,18 @@ impl MatchingEngine {
                     Side::Sell => 1,
                 }],
             );
-            for (price, orders) in book {
+            for (price, level) in book {
                 add(&mut hash, &price.to_le_bytes());
-                for order in orders {
-                    add(&mut hash, &order.order_id.to_le_bytes());
+                let mut next_id = level.head;
+                while let Some(order_id) = next_id {
+                    let order = self
+                        .live_orders
+                        .get(&order_id)
+                        .expect("level points to a live order");
+                    add(&mut hash, &order_id.to_le_bytes());
                     add(&mut hash, &order.remaining_lots.to_le_bytes());
                     add(&mut hash, &order.sequence.to_le_bytes());
+                    next_id = order.next;
                 }
             }
         }
@@ -301,29 +326,35 @@ impl MatchingEngine {
     pub fn check_invariants(&self) -> Result<(), String> {
         let mut indexed = HashSet::new();
         for (side, book) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
-            for (price, orders) in book {
-                if *price <= 0 || orders.is_empty() {
+            for (price, level) in book {
+                if *price <= 0 || level.head.is_none() || level.tail.is_none() {
                     return Err("book contains an invalid or empty price level".into());
                 }
-                for order in orders {
+                let mut total_quantity = 0;
+                let mut previous = None;
+                let mut current = level.head;
+                while let Some(order_id) = current {
+                    let order = self.live_orders.get(&order_id).ok_or_else(|| {
+                        format!("order {order_id} is missing from live-order index")
+                    })?;
                     if order.side != side
                         || order.price_ticks != *price
                         || order.remaining_lots == 0
+                        || order.previous != previous
                     {
-                        return Err(format!(
-                            "order {} has inconsistent book fields",
-                            order.order_id
-                        ));
+                        return Err(format!("order {order_id} has inconsistent queue fields"));
                     }
-                    if !indexed.insert(order.order_id) {
-                        return Err(format!("order {} appears more than once", order.order_id));
+                    if !indexed.insert(order_id) {
+                        return Err(format!("order {order_id} appears more than once"));
                     }
-                    if self.live_orders.get(&order.order_id) != Some(&(side, *price)) {
-                        return Err(format!(
-                            "order {} is missing from live-order index",
-                            order.order_id
-                        ));
-                    }
+                    total_quantity += order.remaining_lots;
+                    previous = Some(order_id);
+                    current = order.next;
+                }
+                if previous != level.tail || total_quantity != level.total_quantity {
+                    return Err(format!(
+                        "price level {price} has inconsistent tail or quantity"
+                    ));
                 }
             }
         }
@@ -342,16 +373,91 @@ impl MatchingEngine {
         self.next_sequence = self.next_sequence.checked_add(1)?;
         Some(self.next_sequence)
     }
-    fn book(&self, side: Side) -> &BTreeMap<PriceTicks, VecDeque<RestingOrder>> {
+    fn book(&self, side: Side) -> &BTreeMap<PriceTicks, PriceLevel> {
         match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         }
     }
-    fn book_mut(&mut self, side: Side) -> &mut BTreeMap<PriceTicks, VecDeque<RestingOrder>> {
+    fn book_mut(&mut self, side: Side) -> &mut BTreeMap<PriceTicks, PriceLevel> {
         match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
+        }
+    }
+
+    fn insert_live_order(&mut self, order: RestingOrder) {
+        let level = self
+            .book_mut(order.side)
+            .entry(order.price_ticks)
+            .or_default();
+        let previous = level.tail;
+        if let Some(previous_id) = previous {
+            self.live_orders
+                .get_mut(&previous_id)
+                .expect("tail is live")
+                .next = Some(order.order_id);
+        }
+        let level = self
+            .book_mut(order.side)
+            .get_mut(&order.price_ticks)
+            .expect("level was inserted");
+        if level.head.is_none() {
+            level.head = Some(order.order_id);
+        }
+        level.tail = Some(order.order_id);
+        level.total_quantity += order.remaining_lots;
+        self.live_orders.insert(
+            order.order_id,
+            LiveOrder {
+                side: order.side,
+                price_ticks: order.price_ticks,
+                remaining_lots: order.remaining_lots,
+                sequence: order.sequence,
+                previous,
+                next: None,
+            },
+        );
+    }
+
+    fn unlink_live_order(&mut self, order_id: OrderId) -> RestingOrder {
+        let order = self.live_orders.remove(&order_id).expect("order is live");
+        if let Some(previous_id) = order.previous {
+            self.live_orders
+                .get_mut(&previous_id)
+                .expect("previous order is live")
+                .next = order.next;
+        } else {
+            self.book_mut(order.side)
+                .get_mut(&order.price_ticks)
+                .expect("price level exists")
+                .head = order.next;
+        }
+        if let Some(next_id) = order.next {
+            self.live_orders
+                .get_mut(&next_id)
+                .expect("next order is live")
+                .previous = order.previous;
+        } else {
+            self.book_mut(order.side)
+                .get_mut(&order.price_ticks)
+                .expect("price level exists")
+                .tail = order.previous;
+        }
+        let book = self.book_mut(order.side);
+        let level = book
+            .get_mut(&order.price_ticks)
+            .expect("price level exists");
+        level.total_quantity -= order.remaining_lots;
+        if level.head.is_none() {
+            book.remove(&order.price_ticks);
+        }
+        RestingOrder {
+            order_id,
+            side: order.side,
+            price_ticks: order.price_ticks,
+            remaining_lots: order.remaining_lots,
+            sequence: order.sequence,
         }
     }
 }
@@ -464,6 +570,28 @@ mod tests {
             vec![2, 3]
         );
         assert_eq!(engine.cancel(99), Err(RejectReason::UnknownOrderId));
+        assert!(engine.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn cancellation_unlinks_middle_order_and_keeps_fifo_order() {
+        let mut engine = MatchingEngine::new();
+        engine.submit(order(1, Side::Buy, 100, 1));
+        engine.submit(order(2, Side::Buy, 100, 1));
+        engine.submit(order(3, Side::Buy, 100, 1));
+        engine.cancel(2).unwrap();
+        engine.submit(order(4, Side::Buy, 100, 1));
+
+        let result = engine.submit(order(5, Side::Sell, 100, 3));
+        assert_eq!(
+            result
+                .trades
+                .iter()
+                .map(|trade| trade.maker_order_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        assert_eq!(engine.live_order_count(), 0);
         assert!(engine.check_invariants().is_ok());
     }
 }

@@ -4,6 +4,8 @@ A deterministic Rust limit-order matching engine for synthetic exchange
 experiments. The current implementation provides price-time priority, partial
 and multi-level fills, cancellation, replace-as-cancel-and-new, integer tick/lot
 arithmetic, and invariant checks. It does not connect to a broker or place orders.
+Each price level stores a FIFO chain keyed by order IDs, allowing cancellation
+to unlink an order without shifting the rest of the queue.
 
 ## Run
 
