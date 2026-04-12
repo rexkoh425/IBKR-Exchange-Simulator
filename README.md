@@ -23,9 +23,11 @@ that the new order receives no inherited queue priority.
 Run `cargo run --release -- benchmark --events 1000000 --seed 2026 --trials 5`
 to generate a deterministic mixed submit/cancel workload before timing the
 matcher. It runs a warm-up, then emits one CSV row per measured trial. The
-output reports commands/s, per-command p50/p95/p99 and maximum service time,
-and the final state fingerprint. Timing includes per-command clock reads. This
-isolated matcher harness is not an open-loop queue or broker-feed measurement.
+output reports submit/cancel/fill counts, commands/s, per-command p50/p95/p99
+and maximum service time, and the final state fingerprint. The seeded workload
+includes crossing prices and actual fills. Timing includes per-command clock
+reads. This isolated matcher harness is not an open-loop queue or broker-feed
+measurement.
 
 ## Event log and replay
 
