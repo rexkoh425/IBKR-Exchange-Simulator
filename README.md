@@ -29,6 +29,11 @@ includes crossing prices and actual fills. Timing includes per-command clock
 reads. This isolated matcher harness is not an open-loop queue or broker-feed
 measurement.
 
+The first 10M-event pinned run is documented in
+[`benchmarks/matcher-10m-2026-11-09.md`](benchmarks/matcher-10m-2026-11-09.md),
+with raw trial rows in the adjacent CSV. Treat that evidence as specific to its
+recorded machine, workload, and timing boundary.
+
 ## Event log and replay
 
 `eventlog` provides schema-versioned JSONL records for synthetic submit/cancel
