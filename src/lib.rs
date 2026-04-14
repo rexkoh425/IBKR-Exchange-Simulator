@@ -10,6 +10,7 @@ pub type QuantityLots = u64;
 
 pub mod benchmark;
 pub mod eventlog;
+pub mod market_data;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {

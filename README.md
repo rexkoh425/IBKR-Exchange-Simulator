@@ -42,8 +42,14 @@ unknown schema versions or gaps in that ordinal. Replaying the same stream
 produces the same receipts and stable state fingerprint. The fingerprint covers
 the engine state needed for future commands; it is not a cryptographic digest.
 
+`market_data` defines versioned L1 quote/trade events and venue-scoped L2
+position-based insert/update/delete records. Replay handles snapshots, gaps,
+disconnects, and invalid books. JSONL round trips are supported. These are
+provider-neutral replay types and fixtures; no IBKR client, subscription, or
+live capture is included.
+
 ## Project status
 
-This repository is being implemented in phases. Market-data ingestion and
-strategy research are not yet implemented. No live
-market data, broker connectivity, or performance results are claimed.
+This repository is being implemented in phases. Live IBKR adapters,
+strategy/paper research, and bounded queue pipelines are not yet implemented.
+No live market data or broker connectivity is claimed.
