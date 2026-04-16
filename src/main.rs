@@ -1,4 +1,4 @@
-use equity_matching_engine::{benchmark, MatchingEngine, OrderRequest, Side};
+use equity_matching_engine::{benchmark, pipeline, MatchingEngine, OrderRequest, Side};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -58,6 +58,54 @@ fn main() {
         }
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("pipeline-benchmark") {
+        let mut events = 10_000_000_usize;
+        let mut rate = 1_000_000_u64;
+        let mut capacity = 65_536_usize;
+        let mut trials = 5_usize;
+        let mut warmup_events = 100_000_usize;
+        let mut args = std::env::args().skip(2);
+        while let Some(flag) = args.next() {
+            let value = args.next().unwrap_or_else(|| usage());
+            match flag.as_str() {
+                "--events" => events = value.parse().unwrap_or_else(|_| usage()),
+                "--rate" => rate = value.parse().unwrap_or_else(|_| usage()),
+                "--capacity" => capacity = value.parse().unwrap_or_else(|_| usage()),
+                "--trials" => trials = value.parse().unwrap_or_else(|_| usage()),
+                "--warmup-events" => warmup_events = value.parse().unwrap_or_else(|_| usage()),
+                _ => usage(),
+            }
+        }
+        if events == 0 || rate == 0 || capacity == 0 || trials == 0 {
+            usage();
+        }
+        let warmup = pipeline::run_trial(warmup_events.max(1), rate, capacity, 2026 ^ u64::MAX);
+        eprintln!(
+            "warmup_events={},warmup_completed={},warmup_p99_ns={}",
+            warmup.events_offered, warmup.events_completed, warmup.p99_end_to_end_ns
+        );
+        println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,high_water_mark,p50_end_to_end_ns,p95_end_to_end_ns,p99_end_to_end_ns,max_end_to_end_ns,checksum");
+        for trial in 1..=trials {
+            let seed = 2026 + trial as u64;
+            let result = pipeline::run_trial(events, rate, capacity, seed);
+            println!(
+                "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{}",
+                result.events_offered,
+                result.events_completed,
+                result.capacity,
+                result.offered_events_per_second,
+                result.completed_events_per_second,
+                result.zero_loss,
+                result.high_water_mark,
+                result.p50_end_to_end_ns,
+                result.p95_end_to_end_ns,
+                result.p99_end_to_end_ns,
+                result.max_end_to_end_ns,
+                result.checksum
+            );
+        }
+        return;
+    }
     let mut engine = MatchingEngine::new();
     engine.submit(OrderRequest {
         order_id: 1,
@@ -84,6 +132,6 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: equity-matching-engine [benchmark --events N --seed N --trials N --warmup-events N]");
+    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark [options]");
     std::process::exit(2);
 }

@@ -34,6 +34,15 @@ The first 10M-event pinned run is documented in
 with raw trial rows in the adjacent CSV. Treat that evidence as specific to its
 recorded machine, workload, and timing boundary.
 
+## Bounded pipeline baseline
+
+`cargo run --release -- pipeline-benchmark --events 10000000 --rate 1000000 --capacity 65536 --trials 5`
+runs an open-loop synthetic producer through a bounded blocking channel and
+checks the completed event count and payload checksum. It measures scheduled-
+arrival-to-processing latency and outstanding high-water mark. The consumer
+currently performs only a deterministic checksum operation; this is a queue
+baseline, not a matching-plus-persistence or IBKR pipeline measurement.
+
 ## Event log and replay
 
 `eventlog` provides schema-versioned JSONL records for synthetic submit/cancel
