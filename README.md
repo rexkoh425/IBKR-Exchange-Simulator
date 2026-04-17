@@ -39,9 +39,11 @@ recorded machine, workload, and timing boundary.
 `cargo run --release -- pipeline-benchmark --events 10000000 --rate 1000000 --capacity 65536 --trials 5`
 runs an open-loop synthetic producer through a bounded blocking channel and
 checks the completed event count and payload checksum. It measures scheduled-
-arrival-to-processing latency and outstanding high-water mark. The consumer
+arrival-to-processing latency and producer-outstanding high-water mark. The consumer
 currently performs only a deterministic checksum operation; this is a queue
 baseline, not a matching-plus-persistence or IBKR pipeline measurement.
+The 10M-event trial results are in
+[`benchmarks/pipeline-10m-2026-11-09.md`](benchmarks/pipeline-10m-2026-11-09.md).
 
 ## Event log and replay
 
