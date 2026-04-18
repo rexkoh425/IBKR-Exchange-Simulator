@@ -70,7 +70,8 @@ pub fn run_trial(
             completed += 1;
         }
         latencies.sort_unstable();
-        (completed, checksum, latencies)
+        let drained_at = start.elapsed();
+        (completed, checksum, latencies, drained_at)
     });
 
     barrier.wait();
@@ -93,8 +94,8 @@ pub fn run_trial(
             .expect("pipeline worker exited early");
     }
     drop(sender);
-    let elapsed = start.elapsed();
-    let (events_completed, checksum, latencies) = worker.join().expect("pipeline worker panicked");
+    let (events_completed, checksum, latencies, elapsed) =
+        worker.join().expect("pipeline worker panicked");
     let total_events = event_count;
     PipelineResult {
         events_offered: total_events,
