@@ -115,6 +115,89 @@ pub fn run_trial(
     }
 }
 
+/// Open-loop benchmark using a bounded, wait-free SPSC ring. This model is
+/// appropriate only when exactly one producer feeds exactly one consumer.
+pub fn run_spsc_trial(
+    event_count: usize,
+    offered_rate: u64,
+    capacity: usize,
+    seed: u64,
+) -> PipelineResult {
+    assert!(event_count > 0 && offered_rate > 0 && capacity > 0);
+    let payloads = generate_payloads(event_count, seed);
+    let expected_checksum = payloads
+        .iter()
+        .fold(0_u64, |sum, value| sum.wrapping_add(*value));
+    let (mut producer, mut consumer) = rtrb::RingBuffer::<PipelineEvent>::new(capacity);
+    let start_cell = Arc::new(OnceLock::<Instant>::new());
+    let consumer_start = start_cell.clone();
+    let worker = thread::spawn(move || {
+        let mut latencies = Vec::with_capacity(event_count);
+        let mut checksum = 0_u64;
+        let mut completed = 0;
+        loop {
+            match consumer.pop() {
+                Ok(event) => {
+                    let start = *consumer_start.get().expect("benchmark start initialized");
+                    let done = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                    latencies.push(done.saturating_sub(event.scheduled_offset_ns));
+                    checksum = checksum.wrapping_add(event.payload);
+                    completed += 1;
+                }
+                Err(_) => {
+                    if completed == event_count {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        latencies.sort_unstable();
+        let drained_at = consumer_start
+            .get()
+            .expect("benchmark start initialized")
+            .elapsed();
+        (completed, checksum, latencies, drained_at)
+    });
+    let start = Instant::now();
+    start_cell.set(start).expect("pipeline start is set once");
+    let mut high_water = 0;
+    for (index, payload) in payloads.into_iter().enumerate() {
+        let target_ns = ((index as u128) * 1_000_000_000_u128 / u128::from(offered_rate))
+            .min(u128::from(u64::MAX)) as u64;
+        let target = start + Duration::from_nanos(target_ns);
+        while Instant::now() < target {
+            std::hint::spin_loop();
+        }
+        loop {
+            match producer.push(PipelineEvent {
+                scheduled_offset_ns: target_ns,
+                payload,
+            }) {
+                Ok(()) => break,
+                Err(rtrb::PushError::Full(_)) => std::hint::spin_loop(),
+            }
+        }
+        high_water = high_water.max(capacity - producer.slots());
+    }
+    let (events_completed, checksum, latencies, elapsed) =
+        worker.join().expect("SPSC worker panicked");
+    PipelineResult {
+        events_offered: event_count,
+        events_completed,
+        capacity,
+        offered_events_per_second: offered_rate,
+        completed_events_per_second: events_completed as f64 / elapsed.as_secs_f64(),
+        zero_loss: events_completed == event_count && checksum == expected_checksum,
+        p50_end_to_end_ns: percentile(&latencies, 50),
+        p95_end_to_end_ns: percentile(&latencies, 95),
+        p99_end_to_end_ns: percentile(&latencies, 99),
+        max_end_to_end_ns: latencies.last().copied().unwrap_or(0),
+        high_water_mark: high_water,
+        checksum,
+    }
+}
+
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -150,5 +233,13 @@ mod tests {
         assert!(result.p50_end_to_end_ns <= result.p95_end_to_end_ns);
         assert!(result.p95_end_to_end_ns <= result.p99_end_to_end_ns);
         assert!(result.p99_end_to_end_ns <= result.max_end_to_end_ns);
+    }
+
+    #[test]
+    fn bounded_spsc_pipeline_completes_every_event_and_checks_payloads() {
+        let result = run_spsc_trial(10_000, 100_000, 128, 44);
+        assert_eq!(result.events_completed, 10_000);
+        assert!(result.zero_loss);
+        assert!(result.p50_end_to_end_ns <= result.p99_end_to_end_ns);
     }
 }

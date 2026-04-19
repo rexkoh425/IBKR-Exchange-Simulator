@@ -64,6 +64,7 @@ fn main() {
         let mut capacity = 65_536_usize;
         let mut trials = 5_usize;
         let mut warmup_events = 100_000_usize;
+        let mut queue = "sync".to_owned();
         let mut args = std::env::args().skip(2);
         while let Some(flag) = args.next() {
             let value = args.next().unwrap_or_else(|| usage());
@@ -73,13 +74,24 @@ fn main() {
                 "--capacity" => capacity = value.parse().unwrap_or_else(|_| usage()),
                 "--trials" => trials = value.parse().unwrap_or_else(|_| usage()),
                 "--warmup-events" => warmup_events = value.parse().unwrap_or_else(|_| usage()),
+                "--queue" => queue = value,
                 _ => usage(),
             }
         }
         if events == 0 || rate == 0 || capacity == 0 || trials == 0 {
             usage();
         }
-        let warmup = pipeline::run_trial(warmup_events.max(1), rate, capacity, 2026 ^ u64::MAX);
+        if queue != "sync" && queue != "spsc" {
+            usage();
+        }
+        let run = |count, seed| {
+            if queue == "spsc" {
+                pipeline::run_spsc_trial(count, rate, capacity, seed)
+            } else {
+                pipeline::run_trial(count, rate, capacity, seed)
+            }
+        };
+        let warmup = run(warmup_events.max(1), 2026 ^ u64::MAX);
         eprintln!(
             "warmup_events={},warmup_completed={},warmup_p99_ns={}",
             warmup.events_offered, warmup.events_completed, warmup.p99_end_to_end_ns
@@ -87,7 +99,7 @@ fn main() {
         println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,high_water_mark,p50_end_to_end_ns,p95_end_to_end_ns,p99_end_to_end_ns,max_end_to_end_ns,checksum");
         for trial in 1..=trials {
             let seed = 2026 + trial as u64;
-            let result = pipeline::run_trial(events, rate, capacity, seed);
+            let result = run(events, seed);
             println!(
                 "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{}",
                 result.events_offered,
