@@ -1,6 +1,15 @@
-use equity_matching_engine::{benchmark, pipeline, MatchingEngine, OrderRequest, Side};
+use equity_matching_engine::{benchmark, ibkr, pipeline, MatchingEngine, OrderRequest, Side};
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("ibkr-capture") {
+        match ibkr::Config::from_env().and_then(ibkr::capture) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("capture failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("benchmark") {
         let mut events = 1_000_000_usize;

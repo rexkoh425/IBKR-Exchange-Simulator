@@ -1,9 +1,9 @@
 # Equity Matching Engine
 
 A deterministic Rust limit-order matching engine for synthetic exchange
-experiments. The current implementation provides price-time priority, partial
+experiments. The implementation provides price-time priority, partial
 and multi-level fills, cancellation, replace-as-cancel-and-new, integer tick/lot
-arithmetic, and invariant checks. It does not connect to a broker or place orders.
+arithmetic, and invariant checks. The IBKR capture command is read-only and never places orders.
 Each price level stores a FIFO chain keyed by order IDs, allowing cancellation
 to unlink an order without shifting the rest of the queue.
 
@@ -34,16 +34,23 @@ The first 10M-event pinned run is documented in
 with raw trial rows in the adjacent CSV. Treat that evidence as specific to its
 recorded machine, workload, and timing boundary.
 
-## Bounded pipeline baseline
+## Bounded pipeline benchmark
 
 `cargo run --release -- pipeline-benchmark --events 10000000 --rate 1000000 --capacity 65536 --trials 5`
 runs an open-loop synthetic producer through a bounded blocking channel and
 checks the completed event count and payload checksum. It measures scheduled-
 arrival-to-processing latency and producer-outstanding high-water mark. The consumer
 currently performs only a deterministic checksum operation; this is a queue
-baseline, not a matching-plus-persistence or IBKR pipeline measurement.
+baseline, not a matching-plus-persistence or IBKR pipeline measurement. Add
+`--queue spsc` to benchmark a bounded `rtrb` SPSC ring. Use SPSC only when the
+architecture truly has one producer and one consumer. Both paths retain and
+count events under pressure instead of silently overwriting them.
 The 10M-event trial results are in
 [`benchmarks/pipeline-10m-2026-11-09.md`](benchmarks/pipeline-10m-2026-11-09.md).
+The first comparison on this Windows machine reached about 998k completed
+events/s for both queues. Neither met the 10 microsecond p99 target; full trial
+rows and measurement caveats are in
+[`benchmarks/queue-2m-2026-11-09.md`](benchmarks/queue-2m-2026-11-09.md).
 
 ## Event log and replay
 
@@ -56,11 +63,28 @@ the engine state needed for future commands; it is not a cryptographic digest.
 `market_data` defines versioned L1 quote/trade events and venue-scoped L2
 position-based insert/update/delete records. Replay handles snapshots, gaps,
 disconnects, and invalid books. JSONL round trips are supported. These are
-provider-neutral replay types and fixtures; no IBKR client, subscription, or
-live capture is included.
+provider-neutral replay types and fixtures.
+
+## IBKR read-only capture
+
+Copy `.env.example` to `.env`, then configure the socket/contract values. Start
+TWS or IB Gateway and log in there; the API client does not take account
+credentials. Run `cargo run --release -- ibkr-capture`. It subscribes to L1 and
+positional market depth and writes timestamped JSONL under `data/ibkr/`. The
+capture currently stores raw SDK debug payloads for inspection; conversion to
+the provider-neutral replay schema is a follow-up. Code 317 depth reset is
+recorded explicitly. Terminal stream errors are logged as gaps.
+
+This is an initial connected capture, not a lossless production feed handler.
+The SDK has internal subscription buffering, the capture polls both streams on
+one thread, and process/disk/network failures can still lose data. A local
+timestamp/ordinal only gives capture order, not exchange order. IBKR market-depth
+initial rows do not provide an authoritative end-of-snapshot marker here, so do
+not treat the reconstructed book as valid without a separate completeness rule.
+Market data and depth access require the appropriate IBKR permissions and
+subscriptions; depth venues and line limits constrain what is available.
 
 ## Project status
 
-This repository is being implemented in phases. Live IBKR adapters,
-strategy/paper research, and bounded queue pipelines are not yet implemented.
-No live market data or broker connectivity is claimed.
+This repository is being implemented in phases. No live market data or broker
+connectivity has been verified in this environment.
