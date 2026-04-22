@@ -17,6 +17,8 @@ pub struct PipelineResult {
     pub p95_end_to_end_ns: u64,
     pub p99_end_to_end_ns: u64,
     pub max_end_to_end_ns: u64,
+    pub p99_queue_residence_ns: u64,
+    pub max_queue_residence_ns: u64,
     pub high_water_mark: usize,
     pub checksum: u64,
 }
@@ -24,6 +26,7 @@ pub struct PipelineResult {
 #[derive(Debug)]
 struct PipelineEvent {
     scheduled_offset_ns: u64,
+    enqueued_offset_ns: u64,
     payload: u64,
 }
 
@@ -53,6 +56,7 @@ pub fn run_trial(
     let worker_outstanding = outstanding.clone();
     let worker = thread::spawn(move || {
         let mut latencies = Vec::with_capacity(event_count);
+        let mut queue_residences = Vec::with_capacity(event_count);
         let mut checksum = 0_u64;
         let mut completed = 0;
         worker_barrier.wait();
@@ -66,12 +70,14 @@ pub fn run_trial(
             worker_outstanding.fetch_sub(1, Ordering::Relaxed);
             let completion_offset = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             latencies.push(completion_offset.saturating_sub(event.scheduled_offset_ns));
+            queue_residences.push(completion_offset.saturating_sub(event.enqueued_offset_ns));
             checksum = checksum.wrapping_add(event.payload);
             completed += 1;
         }
         latencies.sort_unstable();
+        queue_residences.sort_unstable();
         let drained_at = start.elapsed();
-        (completed, checksum, latencies, drained_at)
+        (completed, checksum, latencies, queue_residences, drained_at)
     });
 
     barrier.wait();
@@ -86,15 +92,17 @@ pub fn run_trial(
         }
         let outstanding_count = outstanding.fetch_add(1, Ordering::Relaxed) + 1;
         high_water.fetch_max(outstanding_count, Ordering::Relaxed);
+        let enqueued_offset_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         sender
             .send(PipelineEvent {
                 scheduled_offset_ns: target_ns,
+                enqueued_offset_ns,
                 payload,
             })
             .expect("pipeline worker exited early");
     }
     drop(sender);
-    let (events_completed, checksum, latencies, elapsed) =
+    let (events_completed, checksum, latencies, queue_residences, elapsed) =
         worker.join().expect("pipeline worker panicked");
     let total_events = event_count;
     PipelineResult {
@@ -108,6 +116,8 @@ pub fn run_trial(
         p95_end_to_end_ns: percentile(&latencies, 95),
         p99_end_to_end_ns: percentile(&latencies, 99),
         max_end_to_end_ns: latencies.last().copied().unwrap_or(0),
+        p99_queue_residence_ns: percentile(&queue_residences, 99),
+        max_queue_residence_ns: queue_residences.last().copied().unwrap_or(0),
         // std::sync::mpsc::SyncSender does not expose queue occupancy. The
         // configured hard bound is known; occupancy instrumentation is a later phase.
         high_water_mark: high_water.load(Ordering::Relaxed),
@@ -133,6 +143,7 @@ pub fn run_spsc_trial(
     let consumer_start = start_cell.clone();
     let worker = thread::spawn(move || {
         let mut latencies = Vec::with_capacity(event_count);
+        let mut queue_residences = Vec::with_capacity(event_count);
         let mut checksum = 0_u64;
         let mut completed = 0;
         loop {
@@ -141,6 +152,7 @@ pub fn run_spsc_trial(
                     let start = *consumer_start.get().expect("benchmark start initialized");
                     let done = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
                     latencies.push(done.saturating_sub(event.scheduled_offset_ns));
+                    queue_residences.push(done.saturating_sub(event.enqueued_offset_ns));
                     checksum = checksum.wrapping_add(event.payload);
                     completed += 1;
                 }
@@ -153,11 +165,12 @@ pub fn run_spsc_trial(
             }
         }
         latencies.sort_unstable();
+        queue_residences.sort_unstable();
         let drained_at = consumer_start
             .get()
             .expect("benchmark start initialized")
             .elapsed();
-        (completed, checksum, latencies, drained_at)
+        (completed, checksum, latencies, queue_residences, drained_at)
     });
     let start = Instant::now();
     start_cell.set(start).expect("pipeline start is set once");
@@ -169,9 +182,11 @@ pub fn run_spsc_trial(
         while Instant::now() < target {
             std::hint::spin_loop();
         }
+        let enqueued_offset_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         loop {
             match producer.push(PipelineEvent {
                 scheduled_offset_ns: target_ns,
+                enqueued_offset_ns,
                 payload,
             }) {
                 Ok(()) => break,
@@ -180,7 +195,7 @@ pub fn run_spsc_trial(
         }
         high_water = high_water.max(capacity - producer.slots());
     }
-    let (events_completed, checksum, latencies, elapsed) =
+    let (events_completed, checksum, latencies, queue_residences, elapsed) =
         worker.join().expect("SPSC worker panicked");
     PipelineResult {
         events_offered: event_count,
@@ -193,6 +208,8 @@ pub fn run_spsc_trial(
         p95_end_to_end_ns: percentile(&latencies, 95),
         p99_end_to_end_ns: percentile(&latencies, 99),
         max_end_to_end_ns: latencies.last().copied().unwrap_or(0),
+        p99_queue_residence_ns: percentile(&queue_residences, 99),
+        max_queue_residence_ns: queue_residences.last().copied().unwrap_or(0),
         high_water_mark: high_water,
         checksum,
     }
