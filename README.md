@@ -73,11 +73,16 @@ credentials. Run `cargo run --release -- ibkr-capture`. It subscribes to L1 and
 positional market depth and writes timestamped JSONL under `data/ibkr/`. The
 capture currently stores raw SDK debug payloads for inspection; conversion to
 the provider-neutral replay schema is a follow-up. Code 317 depth reset is
-recorded explicitly. Terminal stream errors are logged as gaps.
+recorded explicitly. Terminal stream errors are logged as gaps. A bounded
+writer queue (set by `IBKR_QUEUE_CAPACITY`) moves JSON encoding and disk writes
+off the polling loop. If that queue fills, capture stops and appends a gap
+record after draining queued events; it does not claim a complete capture.
 
 This is an initial connected capture, not a lossless production feed handler.
 The SDK has internal subscription buffering, the capture polls both streams on
-one thread, and process/disk/network failures can still lose data. A local
+one thread, and process/disk/network failures can still lose data. The local
+bounded writer queue detects pressure but cannot bound the SDK's own internal
+queues. A local
 timestamp/ordinal only gives capture order, not exchange order. IBKR market-depth
 initial rows do not provide an authoritative end-of-snapshot marker here, so do
 not treat the reconstructed book as valid without a separate completeness rule.
