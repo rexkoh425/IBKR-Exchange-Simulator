@@ -48,9 +48,12 @@ count events under pressure instead of silently overwriting them.
 The 10M-event trial results are in
 [`benchmarks/pipeline-10m-2026-11-09.md`](benchmarks/pipeline-10m-2026-11-09.md).
 The first comparison on this Windows machine reached about 998k completed
-events/s for both queues. Neither met the 10 microsecond p99 target; full trial
-rows and measurement caveats are in
-[`benchmarks/queue-2m-2026-11-09.md`](benchmarks/queue-2m-2026-11-09.md).
+events/s for both queues. In a corrected 1M-event run, SPSC queue residence was
+below 10 microseconds in two trials but had a 286.7 microsecond p99 outlier in
+the third; throughput was below 1M/s throughout. This does not establish the
+target. See [queue residence results](benchmarks/queue-residence-1m-2026-11-09.md)
+and the [earlier comparison](benchmarks/queue-2m-2026-11-09.md). Queue residence
+and scheduled-arrival-to-completion are reported separately.
 
 ## Event log and replay
 
