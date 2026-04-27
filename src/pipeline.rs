@@ -21,6 +21,8 @@ pub struct PipelineResult {
     pub max_queue_residence_ns: u64,
     pub high_water_mark: usize,
     pub checksum: u64,
+    pub producer_pin_succeeded: bool,
+    pub consumer_pin_succeeded: bool,
 }
 
 #[derive(Debug)]
@@ -37,6 +39,17 @@ pub fn run_trial(
     offered_rate: u64,
     capacity: usize,
     seed: u64,
+) -> PipelineResult {
+    run_trial_with_affinity(event_count, offered_rate, capacity, seed, None, None)
+}
+
+pub fn run_trial_with_affinity(
+    event_count: usize,
+    offered_rate: u64,
+    capacity: usize,
+    seed: u64,
+    producer_core: Option<usize>,
+    consumer_core: Option<usize>,
 ) -> PipelineResult {
     assert!(event_count > 0, "event count must be positive");
     assert!(offered_rate > 0, "offered rate must be positive");
@@ -55,6 +68,7 @@ pub fn run_trial(
     let worker_start = shared_start.clone();
     let worker_outstanding = outstanding.clone();
     let worker = thread::spawn(move || {
+        let consumer_pin_succeeded = consumer_core.map(pin_current_thread).unwrap_or(false);
         let mut latencies = Vec::with_capacity(event_count);
         let mut queue_residences = Vec::with_capacity(event_count);
         let mut checksum = 0_u64;
@@ -77,9 +91,17 @@ pub fn run_trial(
         latencies.sort_unstable();
         queue_residences.sort_unstable();
         let drained_at = start.elapsed();
-        (completed, checksum, latencies, queue_residences, drained_at)
+        (
+            completed,
+            checksum,
+            latencies,
+            queue_residences,
+            drained_at,
+            consumer_pin_succeeded,
+        )
     });
 
+    let producer_pin_succeeded = producer_core.map(pin_current_thread).unwrap_or(false);
     barrier.wait();
     let start = Instant::now();
     shared_start.set(start).expect("pipeline start is set once");
@@ -102,7 +124,7 @@ pub fn run_trial(
             .expect("pipeline worker exited early");
     }
     drop(sender);
-    let (events_completed, checksum, latencies, queue_residences, elapsed) =
+    let (events_completed, checksum, latencies, queue_residences, elapsed, consumer_pin_succeeded) =
         worker.join().expect("pipeline worker panicked");
     let total_events = event_count;
     PipelineResult {
@@ -122,6 +144,8 @@ pub fn run_trial(
         // configured hard bound is known; occupancy instrumentation is a later phase.
         high_water_mark: high_water.load(Ordering::Relaxed),
         checksum,
+        producer_pin_succeeded,
+        consumer_pin_succeeded,
     }
 }
 
@@ -133,6 +157,17 @@ pub fn run_spsc_trial(
     capacity: usize,
     seed: u64,
 ) -> PipelineResult {
+    run_spsc_trial_with_affinity(event_count, offered_rate, capacity, seed, None, None)
+}
+
+pub fn run_spsc_trial_with_affinity(
+    event_count: usize,
+    offered_rate: u64,
+    capacity: usize,
+    seed: u64,
+    producer_core: Option<usize>,
+    consumer_core: Option<usize>,
+) -> PipelineResult {
     assert!(event_count > 0 && offered_rate > 0 && capacity > 0);
     let payloads = generate_payloads(event_count, seed);
     let expected_checksum = payloads
@@ -142,6 +177,7 @@ pub fn run_spsc_trial(
     let start_cell = Arc::new(OnceLock::<Instant>::new());
     let consumer_start = start_cell.clone();
     let worker = thread::spawn(move || {
+        let consumer_pin_succeeded = consumer_core.map(pin_current_thread).unwrap_or(false);
         let mut latencies = Vec::with_capacity(event_count);
         let mut queue_residences = Vec::with_capacity(event_count);
         let mut checksum = 0_u64;
@@ -170,8 +206,16 @@ pub fn run_spsc_trial(
             .get()
             .expect("benchmark start initialized")
             .elapsed();
-        (completed, checksum, latencies, queue_residences, drained_at)
+        (
+            completed,
+            checksum,
+            latencies,
+            queue_residences,
+            drained_at,
+            consumer_pin_succeeded,
+        )
     });
+    let producer_pin_succeeded = producer_core.map(pin_current_thread).unwrap_or(false);
     let start = Instant::now();
     start_cell.set(start).expect("pipeline start is set once");
     let mut high_water = 0;
@@ -195,7 +239,7 @@ pub fn run_spsc_trial(
         }
         high_water = high_water.max(capacity - producer.slots());
     }
-    let (events_completed, checksum, latencies, queue_residences, elapsed) =
+    let (events_completed, checksum, latencies, queue_residences, elapsed, consumer_pin_succeeded) =
         worker.join().expect("SPSC worker panicked");
     PipelineResult {
         events_offered: event_count,
@@ -212,7 +256,13 @@ pub fn run_spsc_trial(
         max_queue_residence_ns: queue_residences.last().copied().unwrap_or(0),
         high_water_mark: high_water,
         checksum,
+        producer_pin_succeeded,
+        consumer_pin_succeeded,
     }
+}
+
+fn pin_current_thread(core_id: usize) -> bool {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id })
 }
 
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {

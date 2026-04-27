@@ -74,6 +74,8 @@ fn main() {
         let mut trials = 5_usize;
         let mut warmup_events = 100_000_usize;
         let mut queue = "sync".to_owned();
+        let mut producer_core = None;
+        let mut consumer_core = None;
         let mut args = std::env::args().skip(2);
         while let Some(flag) = args.next() {
             let value = args.next().unwrap_or_else(|| usage());
@@ -84,6 +86,12 @@ fn main() {
                 "--trials" => trials = value.parse().unwrap_or_else(|_| usage()),
                 "--warmup-events" => warmup_events = value.parse().unwrap_or_else(|_| usage()),
                 "--queue" => queue = value,
+                "--producer-core" => {
+                    producer_core = Some(value.parse().unwrap_or_else(|_| usage()))
+                }
+                "--consumer-core" => {
+                    consumer_core = Some(value.parse().unwrap_or_else(|_| usage()))
+                }
                 _ => usage(),
             }
         }
@@ -93,11 +101,33 @@ fn main() {
         if queue != "sync" && queue != "spsc" {
             usage();
         }
+        eprintln!(
+            "available_cpu_ids={:?}",
+            core_affinity::get_core_ids()
+                .unwrap_or_default()
+                .iter()
+                .map(|core| core.id)
+                .collect::<Vec<_>>()
+        );
         let run = |count, seed| {
             if queue == "spsc" {
-                pipeline::run_spsc_trial(count, rate, capacity, seed)
+                pipeline::run_spsc_trial_with_affinity(
+                    count,
+                    rate,
+                    capacity,
+                    seed,
+                    producer_core,
+                    consumer_core,
+                )
             } else {
-                pipeline::run_trial(count, rate, capacity, seed)
+                pipeline::run_trial_with_affinity(
+                    count,
+                    rate,
+                    capacity,
+                    seed,
+                    producer_core,
+                    consumer_core,
+                )
             }
         };
         let warmup = run(warmup_events.max(1), 2026 ^ u64::MAX);
@@ -105,18 +135,20 @@ fn main() {
             "warmup_events={},warmup_completed={},warmup_p99_ns={}",
             warmup.events_offered, warmup.events_completed, warmup.p99_end_to_end_ns
         );
-        println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,high_water_mark,p50_scheduled_to_complete_ns,p95_scheduled_to_complete_ns,p99_scheduled_to_complete_ns,max_scheduled_to_complete_ns,p99_queue_residence_ns,max_queue_residence_ns,checksum");
+        println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,producer_pin_succeeded,consumer_pin_succeeded,high_water_mark,p50_scheduled_to_complete_ns,p95_scheduled_to_complete_ns,p99_scheduled_to_complete_ns,max_scheduled_to_complete_ns,p99_queue_residence_ns,max_queue_residence_ns,checksum");
         for trial in 1..=trials {
             let seed = 2026 + trial as u64;
             let result = run(events, seed);
             println!(
-                "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{}",
+                "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{}",
                 result.events_offered,
                 result.events_completed,
                 result.capacity,
                 result.offered_events_per_second,
                 result.completed_events_per_second,
                 result.zero_loss,
+                result.producer_pin_succeeded,
+                result.consumer_pin_succeeded,
                 result.high_water_mark,
                 result.p50_end_to_end_ns,
                 result.p95_end_to_end_ns,
