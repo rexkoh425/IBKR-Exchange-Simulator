@@ -55,6 +55,14 @@ target. See [queue residence results](benchmarks/queue-residence-1m-2026-11-09.m
 and the [earlier comparison](benchmarks/queue-2m-2026-11-09.md). Queue residence
 and scheduled-arrival-to-completion are reported separately.
 
+With SPSC producer/consumer pinned to CPUs 0 and 12 and the offer rate set to
+1.005M/s, three 10M-event trials completed at 1.0003–1.0005M/s with 0.597–0.623
+µs p99 scheduled-to-complete and exact checksums. This meets the synthetic queue
+target under that configuration; millisecond maximum outliers remain. Full
+provenance and limits are in
+[`benchmarks/pinned-spsc-10m-2026-11-09.md`](benchmarks/pinned-spsc-10m-2026-11-09.md).
+It does not establish those metrics for the IBKR capture or persistence path.
+
 ## Event log and replay
 
 `eventlog` provides schema-versioned JSONL records for synthetic submit/cancel
