@@ -45,6 +45,10 @@ baseline, not a matching-plus-persistence or IBKR pipeline measurement. Add
 `--queue spsc` to benchmark a bounded `rtrb` SPSC ring. Use SPSC only when the
 architecture truly has one producer and one consumer. Both paths retain and
 count events under pressure instead of silently overwriting them.
+Pin the benchmark threads with `--producer-core N --consumer-core M`; use IDs
+reported as `available_cpu_ids` by the program and verify both pin-success
+columns in the CSV. An example configuration is `--rate 1005000 --queue spsc
+--producer-core 0 --consumer-core 12`.
 The 10M-event trial results are in
 [`benchmarks/pipeline-10m-2026-11-09.md`](benchmarks/pipeline-10m-2026-11-09.md).
 The first comparison on this Windows machine reached about 998k completed
