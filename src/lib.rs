@@ -597,4 +597,206 @@ mod tests {
         assert_eq!(engine.live_order_count(), 0);
         assert!(engine.check_invariants().is_ok());
     }
+
+    #[derive(Default)]
+    struct SlowReference {
+        orders: Vec<RestingOrder>,
+        used_ids: HashSet<u64>,
+        sequence: u64,
+    }
+
+    impl SlowReference {
+        fn submit(&mut self, request: OrderRequest) -> SubmitResult {
+            if request.price_ticks <= 0 {
+                return SubmitResult::rejected(RejectReason::InvalidPrice);
+            }
+            if request.quantity_lots == 0 {
+                return SubmitResult::rejected(RejectReason::InvalidQuantity);
+            }
+            if self.used_ids.contains(&request.order_id) {
+                return SubmitResult::rejected(RejectReason::DuplicateOrderId);
+            }
+            let Some(sequence) = self.sequence.checked_add(1) else {
+                return SubmitResult::rejected(RejectReason::SequenceExhausted);
+            };
+            self.sequence = sequence;
+            self.used_ids.insert(request.order_id);
+            let mut remaining = request.quantity_lots;
+            let mut trades = Vec::new();
+            while remaining > 0 {
+                let maker_index = self
+                    .orders
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, order)| match request.side {
+                        Side::Buy => {
+                            order.side == Side::Sell && order.price_ticks <= request.price_ticks
+                        }
+                        Side::Sell => {
+                            order.side == Side::Buy && order.price_ticks >= request.price_ticks
+                        }
+                    })
+                    .min_by_key(|(_, order)| match request.side {
+                        Side::Buy => (order.price_ticks, order.sequence),
+                        Side::Sell => (-order.price_ticks, order.sequence),
+                    })
+                    .map(|(index, _)| index);
+                let Some(index) = maker_index else { break };
+                let maker = &mut self.orders[index];
+                let fill = remaining.min(maker.remaining_lots);
+                remaining -= fill;
+                trades.push(Trade {
+                    sequence,
+                    maker_order_id: maker.order_id,
+                    taker_order_id: request.order_id,
+                    taker_side: request.side,
+                    price_ticks: maker.price_ticks,
+                    quantity_lots: fill,
+                });
+                maker.remaining_lots -= fill;
+                if maker.remaining_lots == 0 {
+                    self.orders.remove(index);
+                }
+            }
+            if remaining > 0 {
+                self.orders.push(RestingOrder {
+                    order_id: request.order_id,
+                    side: request.side,
+                    price_ticks: request.price_ticks,
+                    remaining_lots: remaining,
+                    sequence,
+                });
+            }
+            SubmitResult {
+                sequence: Some(sequence),
+                trades,
+                resting_quantity_lots: remaining,
+                rejection: None,
+            }
+        }
+
+        fn cancel(&mut self, order_id: u64) -> Result<RestingOrder, RejectReason> {
+            let Some(index) = self
+                .orders
+                .iter()
+                .position(|order| order.order_id == order_id)
+            else {
+                return Err(RejectReason::UnknownOrderId);
+            };
+            self.sequence = self
+                .sequence
+                .checked_add(1)
+                .ok_or(RejectReason::SequenceExhausted)?;
+            Ok(self.orders.remove(index))
+        }
+    }
+
+    #[test]
+    fn seeded_command_sequences_match_independent_slow_reference() {
+        for seed in 1..=12_u64 {
+            let mut random = seed;
+            let mut engine = MatchingEngine::new();
+            let mut reference = SlowReference::default();
+            let mut next_id = 1_u64;
+            for step in 0..2_000 {
+                random = random.wrapping_add(0x9e3779b97f4a7c15);
+                let choice = splitmix(random);
+                if !reference.orders.is_empty() && choice.is_multiple_of(5) {
+                    let selected = (splitmix(choice) as usize) % reference.orders.len();
+                    let order_id = reference.orders[selected].order_id;
+                    assert_eq!(
+                        engine.cancel(order_id),
+                        reference.cancel(order_id),
+                        "seed={seed} step={step}"
+                    );
+                } else {
+                    let side = if choice & 1 == 0 {
+                        Side::Buy
+                    } else {
+                        Side::Sell
+                    };
+                    let price = 95 + (splitmix(choice) % 11) as i64;
+                    let quantity = splitmix(price as u64 ^ choice) % 50 + 1;
+                    let request = order(next_id, side, price, quantity);
+                    next_id += 1;
+                    let actual = engine.submit(request);
+                    let expected = reference.submit(request);
+                    assert_eq!(actual, expected, "seed={seed} step={step}");
+                    let executed: u64 = actual.trades.iter().map(|trade| trade.quantity_lots).sum();
+                    assert_eq!(
+                        executed + actual.resting_quantity_lots,
+                        quantity,
+                        "seed={seed} step={step}"
+                    );
+                    for trade in actual.trades {
+                        assert!(trade.quantity_lots > 0);
+                        assert_eq!(trade.taker_order_id, request.order_id);
+                        match trade.taker_side {
+                            Side::Buy => assert!(trade.price_ticks <= request.price_ticks),
+                            Side::Sell => assert!(trade.price_ticks >= request.price_ticks),
+                        }
+                    }
+                }
+                for side in [Side::Buy, Side::Sell] {
+                    for price in 95..=105 {
+                        let actual_orders = engine.resting_orders(side, price);
+                        let expected_orders: Vec<_> = reference
+                            .orders
+                            .iter()
+                            .copied()
+                            .filter(|order| order.side == side && order.price_ticks == price)
+                            .collect();
+                        assert_eq!(
+                            actual_orders, expected_orders,
+                            "seed={seed} step={step} side={side:?} price={price}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    engine.best_bid(),
+                    reference
+                        .orders
+                        .iter()
+                        .filter(|o| o.side == Side::Buy)
+                        .map(|o| o.price_ticks)
+                        .max()
+                        .map(|p| (
+                            p,
+                            reference
+                                .orders
+                                .iter()
+                                .filter(|o| o.side == Side::Buy && o.price_ticks == p)
+                                .map(|o| o.remaining_lots)
+                                .sum()
+                        ))
+                );
+                assert_eq!(
+                    engine.best_ask(),
+                    reference
+                        .orders
+                        .iter()
+                        .filter(|o| o.side == Side::Sell)
+                        .map(|o| o.price_ticks)
+                        .min()
+                        .map(|p| (
+                            p,
+                            reference
+                                .orders
+                                .iter()
+                                .filter(|o| o.side == Side::Sell && o.price_ticks == p)
+                                .map(|o| o.remaining_lots)
+                                .sum()
+                        ))
+                );
+                assert!(engine.check_invariants().is_ok(), "seed={seed} step={step}");
+            }
+        }
+    }
+
+    fn splitmix(mut value: u64) -> u64 {
+        value = value.wrapping_add(0x9e3779b97f4a7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        value ^ (value >> 31)
+    }
 }
