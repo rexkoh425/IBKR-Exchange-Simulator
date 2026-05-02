@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
-pub const MARKET_EVENT_SCHEMA_VERSION: u16 = 1;
+pub const MARKET_EVENT_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BookSide {
@@ -72,9 +72,17 @@ pub struct MarketEvent {
     pub schema_version: u16,
     pub ordinal: u64,
     pub instrument: String,
+    #[serde(default = "default_source")]
+    pub source: String,
     pub source_time_ns: Option<u64>,
     pub receive_time_ns: u64,
     pub payload: MarketPayload,
+    #[serde(default)]
+    pub raw_payload: Option<String>,
+}
+
+fn default_source() -> String {
+    "synthetic".into()
 }
 
 impl MarketEvent {
@@ -88,10 +96,26 @@ impl MarketEvent {
             schema_version: MARKET_EVENT_SCHEMA_VERSION,
             ordinal,
             instrument: instrument.into(),
+            source: default_source(),
             source_time_ns: None,
             receive_time_ns,
             payload,
+            raw_payload: None,
         }
+    }
+
+    pub fn from_source(
+        ordinal: u64,
+        instrument: impl Into<String>,
+        source: impl Into<String>,
+        receive_time_ns: u64,
+        payload: MarketPayload,
+        raw_payload: Option<String>,
+    ) -> Self {
+        let mut event = Self::new(ordinal, instrument, receive_time_ns, payload);
+        event.source = source.into();
+        event.raw_payload = raw_payload;
+        event
     }
 }
 
