@@ -1,10 +1,11 @@
 //! IBKR TWS/Gateway market-data capture. Account login remains in TWS/Gateway.
+use crate::market_data::{BookSide, DepthAction, DepthLevel, MarketEvent, MarketPayload};
 use ibapi::client::blocking::Client;
+use ibapi::contracts::tick_types::TickType;
 use ibapi::contracts::Contract;
-use ibapi::market_data::realtime::MarketDepths;
+use ibapi::market_data::realtime::{MarketDepths, TickTypes};
 use ibapi::market_data::SmartDepth;
 use ibapi::subscriptions::SubscriptionItem;
-use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -108,12 +109,234 @@ fn load_env_file() -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-struct Record {
-    capture_ordinal: u64,
-    receive_time_ns: u64,
-    source: &'static str,
-    data: String,
+#[derive(Debug, Default)]
+pub struct L1Normalizer {
+    bid_ticks: Option<i64>,
+    bid_lots: u64,
+    ask_ticks: Option<i64>,
+    ask_lots: u64,
+}
+
+impl L1Normalizer {
+    pub fn normalize(&mut self, tick: &TickTypes, tick_size: f64) -> Result<MarketPayload, String> {
+        let mut quote_changed = false;
+        match tick {
+            TickTypes::Price(value) => match value.tick_type {
+                TickType::Bid => {
+                    self.bid_ticks = to_ticks(value.price, tick_size)?;
+                    quote_changed = true;
+                }
+                TickType::Ask => {
+                    self.ask_ticks = to_ticks(value.price, tick_size)?;
+                    quote_changed = true;
+                }
+                _ => {
+                    return Ok(MarketPayload::OtherTick {
+                        tick_type: format!("{:?}", value.tick_type),
+                        value_f64_bits: Some(value.price.to_bits()),
+                    })
+                }
+            },
+            TickTypes::Size(value) => match value.tick_type {
+                TickType::BidSize => {
+                    self.bid_lots = to_lots(value.size)?;
+                    quote_changed = true;
+                }
+                TickType::AskSize => {
+                    self.ask_lots = to_lots(value.size)?;
+                    quote_changed = true;
+                }
+                _ => {
+                    return Ok(MarketPayload::OtherTick {
+                        tick_type: format!("{:?}", value.tick_type),
+                        value_f64_bits: Some(value.size.to_bits()),
+                    })
+                }
+            },
+            TickTypes::PriceSize(value) => {
+                quote_changed |=
+                    self.update_price(value.price_tick_type, value.price, tick_size)?;
+                quote_changed |= self.update_size(value.size_tick_type, value.size)?;
+                if !quote_changed {
+                    return Ok(MarketPayload::OtherTick {
+                        tick_type: format!("{:?}", value.price_tick_type),
+                        value_f64_bits: Some(value.price.to_bits()),
+                    });
+                }
+            }
+            TickTypes::SnapshotEnd => {
+                return Ok(MarketPayload::OtherTick {
+                    tick_type: "SnapshotEnd".into(),
+                    value_f64_bits: None,
+                })
+            }
+            TickTypes::Generic(value) => {
+                return Ok(MarketPayload::OtherTick {
+                    tick_type: format!("{:?}", value.tick_type),
+                    value_f64_bits: Some(value.value.to_bits()),
+                })
+            }
+            other => {
+                return Ok(MarketPayload::OtherTick {
+                    tick_type: tick_name(other).to_owned(),
+                    value_f64_bits: None,
+                })
+            }
+        }
+        debug_assert!(quote_changed);
+        Ok(MarketPayload::Quote {
+            bid_ticks: self.bid_ticks,
+            bid_lots: self.bid_lots,
+            ask_ticks: self.ask_ticks,
+            ask_lots: self.ask_lots,
+        })
+    }
+
+    fn update_price(
+        &mut self,
+        tick_type: TickType,
+        price: f64,
+        tick_size: f64,
+    ) -> Result<bool, String> {
+        match tick_type {
+            TickType::Bid => {
+                self.bid_ticks = to_ticks(price, tick_size)?;
+                Ok(true)
+            }
+            TickType::Ask => {
+                self.ask_ticks = to_ticks(price, tick_size)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn update_size(&mut self, tick_type: TickType, size: f64) -> Result<bool, String> {
+        match tick_type {
+            TickType::BidSize => {
+                self.bid_lots = to_lots(size)?;
+                Ok(true)
+            }
+            TickType::AskSize => {
+                self.ask_lots = to_lots(size)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+fn tick_name(tick: &TickTypes) -> &'static str {
+    match tick {
+        TickTypes::String(_) => "String",
+        TickTypes::Generic(_) => "Generic",
+        TickTypes::OptionComputation(_) => "OptionComputation",
+        TickTypes::SnapshotEnd => "SnapshotEnd",
+        TickTypes::RequestParameters(_) => "RequestParameters",
+        TickTypes::PriceSize(_) => "PriceSize",
+        TickTypes::MarketDataType(_) => "MarketDataType",
+        TickTypes::Price(_) => "Price",
+        TickTypes::Size(_) => "Size",
+    }
+}
+
+fn to_ticks(price: f64, tick_size: f64) -> Result<Option<i64>, String> {
+    if !price.is_finite() {
+        return Err("IBKR price is not finite".into());
+    }
+    if price <= 0.0 {
+        return Ok(None);
+    }
+    let ticks = price / tick_size;
+    let rounded = ticks.round();
+    if (ticks - rounded).abs() > 1e-7 || rounded > i64::MAX as f64 {
+        return Err(format!(
+            "price {price} is not representable in configured ticks"
+        ));
+    }
+    Ok(Some(rounded as i64))
+}
+
+fn to_lots(size: f64) -> Result<u64, String> {
+    if !size.is_finite() || size < 0.0 || size.fract().abs() > 1e-7 || size > u64::MAX as f64 {
+        return Err(format!(
+            "size {size} is not representable as integer shares"
+        ));
+    }
+    Ok(size.round() as u64)
+}
+
+pub fn normalize_depth(
+    depth: &MarketDepths,
+    tick_size: f64,
+    venue: &str,
+) -> Result<MarketPayload, String> {
+    let (position, operation, side, price, size, market_maker) = match depth {
+        MarketDepths::Reset => {
+            return Ok(MarketPayload::DepthSnapshotBegin {
+                venue: venue.into(),
+            })
+        }
+        MarketDepths::MarketDepth(value) => (
+            value.position,
+            value.operation,
+            value.side,
+            value.price,
+            value.size,
+            String::new(),
+        ),
+        MarketDepths::MarketDepthL2(value) => (
+            value.position,
+            value.operation,
+            value.side,
+            value.price,
+            value.size,
+            value.market_maker.clone(),
+        ),
+    };
+    let position =
+        usize::try_from(position).map_err(|_| "negative IBKR depth position".to_owned())?;
+    let side = match side {
+        0 => BookSide::Ask,
+        1 => BookSide::Bid,
+        _ => return Err(format!("unknown IBKR depth side {side}")),
+    };
+    let action = match operation {
+        0 => DepthAction::Insert {
+            position,
+            level: make_depth_level(price, size, tick_size, market_maker)?,
+        },
+        1 => DepthAction::Update {
+            position,
+            level: make_depth_level(price, size, tick_size, market_maker)?,
+        },
+        2 => DepthAction::Delete { position },
+        _ => return Err(format!("unknown IBKR depth operation {operation}")),
+    };
+    Ok(MarketPayload::DepthUpdate {
+        venue: venue.into(),
+        side,
+        action,
+    })
+}
+
+fn make_depth_level(
+    price: f64,
+    size: f64,
+    tick_size: f64,
+    market_maker: String,
+) -> Result<DepthLevel, String> {
+    let price_ticks =
+        to_ticks(price, tick_size)?.ok_or_else(|| "IBKR depth price is nonpositive".to_owned())?;
+    let quantity_lots = to_lots(size)?;
+    if quantity_lots == 0 {
+        return Err("IBKR depth size is zero".into());
+    }
+    Ok(DepthLevel {
+        price_ticks,
+        quantity_lots,
+        market_maker,
+    })
 }
 
 pub fn capture(config: Config) -> Result<(), String> {
@@ -121,24 +344,25 @@ pub fn capture(config: Config) -> Result<(), String> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_nanos();
     let path = config
         .capture_dir
         .join(format!("{}-{stamp}.jsonl", config.symbol));
     let out =
         BufWriter::with_capacity(1024 * 1024, File::create(&path).map_err(|e| e.to_string())?);
-    let (sender, receiver) = sync_channel::<Record>(config.queue_capacity);
+    let (sender, receiver) = sync_channel::<MarketEvent>(config.queue_capacity);
     let writer = std::thread::spawn(move || -> Result<u64, String> {
         let mut out = out;
         let mut written = 0_u64;
-        while let Ok(record) = receiver.recv() {
-            serde_json::to_writer(&mut out, &record).map_err(|e| e.to_string())?;
+        while let Ok(event) = receiver.recv() {
+            serde_json::to_writer(&mut out, &event).map_err(|e| e.to_string())?;
             out.write_all(b"\n").map_err(|e| e.to_string())?;
-            written = record.capture_ordinal;
+            written = event.ordinal;
         }
         out.flush().map_err(|e| e.to_string())?;
         Ok(written)
     });
+
     let address = format!("{}:{}", config.host, config.port);
     let client = Client::connect(&address, config.client_id)
         .map_err(|e| format!("IBKR connect failed: {e}"))?;
@@ -155,90 +379,99 @@ pub fn capture(config: Config) -> Result<(), String> {
         .smart_depth(SmartDepth::No)
         .subscribe()
         .map_err(|e| format!("IBKR depth subscription failed: {e}"))?;
+
     let started = Instant::now();
     let mut ordinal = 0_u64;
-    let mut dropped_or_invalid = 0_u64;
-    let mut overflow_reason = None;
-    while started.elapsed() < Duration::from_secs(config.seconds) {
+    let mut quote = L1Normalizer::default();
+    let mut failure = None;
+    if let Err(error) = send_event(
+        &sender,
+        &mut ordinal,
+        &config,
+        MarketPayload::DepthSnapshotBegin {
+            venue: config.exchange.clone(),
+        },
+        Some("IBKR initial depth; completion boundary unavailable".into()),
+    ) {
+        failure = Some(error);
+    }
+    while failure.is_none() && started.elapsed() < Duration::from_secs(config.seconds) {
         let mut did_work = false;
         if let Some(item) = l1.next_timeout(Duration::from_millis(1)) {
             did_work = true;
             match item {
                 Ok(SubscriptionItem::Data(tick)) => {
-                    if let Err(reason) =
-                        send_record(&sender, &mut ordinal, "l1", &format!("{tick:?}"))
-                    {
-                        overflow_reason = Some(reason);
-                        dropped_or_invalid += 1;
-                        break;
+                    match quote.normalize(&tick, config.tick_size) {
+                        Ok(payload) => {
+                            if let Err(error) = send_event(
+                                &sender,
+                                &mut ordinal,
+                                &config,
+                                payload,
+                                Some(format!("{tick:?}")),
+                            ) {
+                                failure = Some(error);
+                            }
+                        }
+                        Err(error) => failure = Some(format!("invalid L1 value: {error}")),
                     }
                 }
-                Ok(SubscriptionItem::Notice(n)) => {
-                    if let Err(reason) =
-                        send_record(&sender, &mut ordinal, "notice", &format!("{n:?}"))
-                    {
-                        overflow_reason = Some(reason);
-                        dropped_or_invalid += 1;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if let Err(reason) = send_record(
+                Ok(SubscriptionItem::Notice(notice)) => {
+                    let payload = MarketPayload::OtherTick {
+                        tick_type: "IBKRNotice".into(),
+                        value_f64_bits: None,
+                    };
+                    if let Err(error) = send_event(
                         &sender,
                         &mut ordinal,
-                        "gap",
-                        &format!("L1 terminal error: {e}"),
+                        &config,
+                        payload,
+                        Some(format!("{notice:?}")),
                     ) {
-                        overflow_reason = Some(reason);
+                        failure = Some(error);
                     }
-                    dropped_or_invalid += 1;
-                    break;
                 }
+                Err(error) => failure = Some(format!("IBKR L1 terminal error: {error}")),
             }
+        }
+        if failure.is_some() {
+            break;
         }
         if let Some(item) = l2.next_timeout(Duration::from_millis(1)) {
             did_work = true;
             match item {
-                Ok(SubscriptionItem::Data(MarketDepths::Reset)) => {
-                    if let Err(reason) = send_record(
-                        &sender,
-                        &mut ordinal,
-                        "depth_reset",
-                        "code 317; book must be cleared and rebuilt",
-                    ) {
-                        overflow_reason = Some(reason);
-                    }
-                }
                 Ok(SubscriptionItem::Data(depth)) => {
-                    if let Err(reason) =
-                        send_record(&sender, &mut ordinal, "l2", &format!("{depth:?}"))
-                    {
-                        overflow_reason = Some(reason);
-                        dropped_or_invalid += 1;
-                        break;
+                    match normalize_depth(&depth, config.tick_size, &config.exchange) {
+                        Ok(payload) => {
+                            if let Err(error) = send_event(
+                                &sender,
+                                &mut ordinal,
+                                &config,
+                                payload,
+                                Some(format!("{depth:?}")),
+                            ) {
+                                failure = Some(error);
+                            }
+                        }
+                        Err(error) => failure = Some(format!("invalid depth update: {error}")),
                     }
                 }
-                Ok(SubscriptionItem::Notice(n)) => {
-                    if let Err(reason) =
-                        send_record(&sender, &mut ordinal, "notice", &format!("{n:?}"))
-                    {
-                        overflow_reason = Some(reason);
-                        dropped_or_invalid += 1;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if let Err(reason) = send_record(
+                Ok(SubscriptionItem::Notice(notice)) => {
+                    let payload = MarketPayload::OtherTick {
+                        tick_type: "IBKRNotice".into(),
+                        value_f64_bits: None,
+                    };
+                    if let Err(error) = send_event(
                         &sender,
                         &mut ordinal,
-                        "gap",
-                        &format!("L2 terminal error: {e}"),
+                        &config,
+                        payload,
+                        Some(format!("{notice:?}")),
                     ) {
-                        overflow_reason = Some(reason);
+                        failure = Some(error);
                     }
-                    dropped_or_invalid += 1;
-                    break;
                 }
+                Err(error) => failure = Some(format!("IBKR L2 terminal error: {error}")),
             }
         }
         if !did_work {
@@ -249,59 +482,211 @@ pub fn capture(config: Config) -> Result<(), String> {
     let written = writer
         .join()
         .map_err(|_| "capture writer panicked".to_owned())??;
-    let had_overflow = overflow_reason.is_some();
-    if let Some(reason) = overflow_reason {
-        append_gap(&path, written + 1, &reason)?;
+    if let Some(reason) = failure {
+        append_incomplete_markers(&path, written + 1, &config, &reason)?;
+        eprintln!(
+            "capture stopped with incomplete session after {written} normalized events: {reason}"
+        );
+    } else {
+        eprintln!("capture completed cleanly with {written} normalized events; initial depth remains conservatively incomplete");
     }
-    eprintln!("capture_records={written},invalidating_errors={dropped_or_invalid},overflow={had_overflow}; raw SDK values are preserved; see README for limits");
     Ok(())
 }
 
-fn send_record(
-    sender: &SyncSender<Record>,
+fn send_event(
+    sender: &SyncSender<MarketEvent>,
     ordinal: &mut u64,
-    source: &'static str,
-    data: &str,
+    config: &Config,
+    payload: MarketPayload,
+    raw_payload: Option<String>,
 ) -> Result<(), String> {
     *ordinal += 1;
-    let record = Record {
-        capture_ordinal: *ordinal,
-        receive_time_ns: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64,
-        source,
-        data: data.into(),
-    };
-    sender.try_send(record).map_err(|error| match error {
-        TrySendError::Full(_) => {
-            "bounded capture queue full; captured stream stopped and marked with a gap".to_owned()
-        }
-        TrySendError::Disconnected(_) => {
-            "capture writer stopped; captured stream marked with a gap".to_owned()
-        }
+    let receive_time_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
+    let event = MarketEvent::from_source(
+        *ordinal,
+        &config.symbol,
+        "IBKR",
+        receive_time_ns,
+        payload,
+        raw_payload,
+    );
+    sender.try_send(event).map_err(|error| match error {
+        TrySendError::Full(_) => "bounded capture queue full; capture stopped".to_owned(),
+        TrySendError::Disconnected(_) => "capture writer stopped".to_owned(),
     })
 }
 
-fn append_gap(path: &std::path::Path, ordinal: u64, reason: &str) -> Result<(), String> {
+fn append_incomplete_markers(
+    path: &std::path::Path,
+    ordinal: u64,
+    config: &Config,
+    reason: &str,
+) -> Result<(), String> {
     let file = OpenOptions::new()
         .append(true)
         .open(path)
         .map_err(|e| e.to_string())?;
     let mut out = BufWriter::new(file);
-    let record = Record {
-        capture_ordinal: ordinal,
-        receive_time_ns: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64,
-        source: "gap",
-        data: reason.to_owned(),
-    };
-    serde_json::to_writer(&mut out, &record).map_err(|e| e.to_string())?;
-    out.write_all(b"\n")
-        .and_then(|_| out.flush())
-        .map_err(|e| e.to_string())
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
+    let markers = [
+        MarketEvent::from_source(
+            ordinal,
+            &config.symbol,
+            "IBKR",
+            time,
+            MarketPayload::Disconnect {
+                feed: "IBKR".into(),
+                reason: reason.into(),
+            },
+            None,
+        ),
+        MarketEvent::from_source(
+            ordinal + 1,
+            &config.symbol,
+            "IBKR",
+            time,
+            MarketPayload::DepthGap {
+                venue: config.exchange.clone(),
+                reason: reason.into(),
+            },
+            None,
+        ),
+    ];
+    for marker in &markers {
+        serde_json::to_writer(&mut out, marker).map_err(|e| e.to_string())?;
+        out.write_all(b"\n").map_err(|e| e.to_string())?;
+    }
+    out.flush().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ibapi::market_data::realtime::{TickPrice, TickSize};
+
+    #[test]
+    fn l1_bid_ask_ticks_normalize_to_integer_ticks_and_shares() {
+        let mut normalizer = L1Normalizer::default();
+        let bid_price = TickTypes::Price(TickPrice {
+            tick_type: TickType::Bid,
+            price: 100.25,
+            ..TickPrice::default()
+        });
+        let bid_size = TickTypes::Size(TickSize {
+            tick_type: TickType::BidSize,
+            size: 12.0,
+        });
+        let ask_price = TickTypes::Price(TickPrice {
+            tick_type: TickType::Ask,
+            price: 100.30,
+            ..TickPrice::default()
+        });
+        let ask_size = TickTypes::Size(TickSize {
+            tick_type: TickType::AskSize,
+            size: 8.0,
+        });
+        assert_eq!(
+            normalizer.normalize(&bid_price, 0.01).unwrap(),
+            MarketPayload::Quote {
+                bid_ticks: Some(10025),
+                bid_lots: 0,
+                ask_ticks: None,
+                ask_lots: 0
+            }
+        );
+        assert_eq!(
+            normalizer.normalize(&bid_size, 0.01).unwrap(),
+            MarketPayload::Quote {
+                bid_ticks: Some(10025),
+                bid_lots: 12,
+                ask_ticks: None,
+                ask_lots: 0
+            }
+        );
+        assert_eq!(
+            normalizer.normalize(&ask_price, 0.01).unwrap(),
+            MarketPayload::Quote {
+                bid_ticks: Some(10025),
+                bid_lots: 12,
+                ask_ticks: Some(10030),
+                ask_lots: 0
+            }
+        );
+        assert_eq!(
+            normalizer.normalize(&ask_size, 0.01).unwrap(),
+            MarketPayload::Quote {
+                bid_ticks: Some(10025),
+                bid_lots: 12,
+                ask_ticks: Some(10030),
+                ask_lots: 8
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unrepresentable_prices_and_fractional_share_sizes() {
+        let mut normalizer = L1Normalizer::default();
+        let price = TickTypes::Price(TickPrice {
+            tick_type: TickType::Bid,
+            price: 100.253,
+            ..TickPrice::default()
+        });
+        assert!(normalizer.normalize(&price, 0.01).is_err());
+        let size = TickTypes::Size(TickSize {
+            tick_type: TickType::BidSize,
+            size: 1.5,
+        });
+        assert!(normalizer.normalize(&size, 0.01).is_err());
+    }
+
+    #[test]
+    fn depth_insert_preserves_position_side_market_maker_and_raw_fields() {
+        let depth = MarketDepths::MarketDepthL2(ibapi::market_data::realtime::MarketDepthL2 {
+            position: 2,
+            market_maker: "NASDAQ".into(),
+            operation: 0,
+            side: 1,
+            price: 101.25,
+            size: 20.0,
+            smart_depth: false,
+        });
+        assert_eq!(
+            normalize_depth(&depth, 0.01, "NASDAQ").unwrap(),
+            MarketPayload::DepthUpdate {
+                venue: "NASDAQ".into(),
+                side: BookSide::Bid,
+                action: DepthAction::Insert {
+                    position: 2,
+                    level: DepthLevel {
+                        price_ticks: 10125,
+                        quantity_lots: 20,
+                        market_maker: "NASDAQ".into()
+                    }
+                },
+            }
+        );
+        let reset = normalize_depth(&MarketDepths::Reset, 0.01, "NASDAQ").unwrap();
+        assert_eq!(
+            reset,
+            MarketPayload::DepthSnapshotBegin {
+                venue: "NASDAQ".into()
+            }
+        );
+
+        let event = MarketEvent::from_source(1, "AAPL", "IBKR", 123, reset, Some("Reset".into()));
+        let mut bytes = Vec::new();
+        crate::market_data::write_jsonl(&mut bytes, std::slice::from_ref(&event)).unwrap();
+        assert_eq!(
+            crate::market_data::read_jsonl(std::io::Cursor::new(bytes)).unwrap(),
+            vec![event]
+        );
+    }
 }

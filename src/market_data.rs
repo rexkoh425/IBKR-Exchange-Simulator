@@ -43,6 +43,10 @@ pub enum MarketPayload {
         price_ticks: i64,
         quantity_lots: u64,
     },
+    OtherTick {
+        tick_type: String,
+        value_f64_bits: Option<u64>,
+    },
     DepthSnapshotBegin {
         venue: String,
     },
@@ -271,6 +275,7 @@ impl MarketReplay {
                 state.last_trade = Some((*price_ticks, *quantity_lots));
                 state.last_receive_time_ns = Some(event.receive_time_ns);
             }
+            MarketPayload::OtherTick { .. } => {}
             MarketPayload::DepthSnapshotBegin { venue } => {
                 let book = self
                     .depth
