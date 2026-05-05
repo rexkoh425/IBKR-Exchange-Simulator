@@ -47,6 +47,13 @@ pub enum MarketPayload {
         tick_type: String,
         value_f64_bits: Option<u64>,
     },
+    SessionStart {
+        session_id: String,
+    },
+    SessionEnd {
+        session_id: String,
+        complete: bool,
+    },
     DepthSnapshotBegin {
         venue: String,
     },
@@ -214,6 +221,7 @@ pub struct MarketReplay {
     level1: HashMap<String, Level1State>,
     depth: HashMap<(String, String), DepthBook>,
     disconnected_feeds: HashMap<String, String>,
+    saw_gap: bool,
 }
 
 impl MarketReplay {
@@ -276,6 +284,12 @@ impl MarketReplay {
                 state.last_receive_time_ns = Some(event.receive_time_ns);
             }
             MarketPayload::OtherTick { .. } => {}
+            MarketPayload::SessionStart { .. } => {}
+            MarketPayload::SessionEnd { complete, .. } => {
+                if !complete {
+                    self.saw_gap = true;
+                }
+            }
             MarketPayload::DepthSnapshotBegin { venue } => {
                 let book = self
                     .depth
@@ -354,6 +368,7 @@ impl MarketReplay {
                 }
             }
             MarketPayload::DepthGap { venue, reason } => {
+                self.saw_gap = true;
                 let book = self
                     .depth
                     .entry((event.instrument.clone(), venue.clone()))
@@ -363,6 +378,7 @@ impl MarketReplay {
                 book.invalid_reason = Some(reason.clone());
             }
             MarketPayload::Disconnect { feed, reason } => {
+                self.saw_gap = true;
                 self.disconnected_feeds.insert(feed.clone(), reason.clone());
                 if let Some(state) = self.level1.get_mut(&event.instrument) {
                     state.valid = false;
@@ -390,6 +406,10 @@ impl MarketReplay {
     }
     pub fn feed_disconnect_reason(&self, feed: &str) -> Option<&str> {
         self.disconnected_feeds.get(feed).map(String::as_str)
+    }
+
+    pub fn has_incomplete_data(&self) -> bool {
+        self.saw_gap || self.depth.values().any(|book| !book.valid)
     }
 
     pub fn state_fingerprint(&self) -> u64 {

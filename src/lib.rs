@@ -13,6 +13,7 @@ pub mod eventlog;
 pub mod ibkr;
 pub mod market_data;
 pub mod pipeline;
+pub mod replay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
