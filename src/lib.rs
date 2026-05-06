@@ -44,6 +44,7 @@ pub enum RejectReason {
     InvalidPrice,
     InvalidQuantity,
     DuplicateOrderId,
+    AggregateQuantityOverflow,
     UnknownOrderId,
     SequenceExhausted,
 }
@@ -124,6 +125,9 @@ impl MatchingEngine {
         }
         if self.used_order_ids.contains(&request.order_id) {
             return SubmitResult::rejected(RejectReason::DuplicateOrderId);
+        }
+        if self.resting_quantity_would_overflow(request) {
+            return SubmitResult::rejected(RejectReason::AggregateQuantityOverflow);
         }
         let Some(sequence) = self.allocate_sequence() else {
             return SubmitResult::rejected(RejectReason::SequenceExhausted);
@@ -377,6 +381,57 @@ impl MatchingEngine {
         self.next_sequence = self.next_sequence.checked_add(1)?;
         Some(self.next_sequence)
     }
+
+    fn resting_quantity_would_overflow(&self, request: OrderRequest) -> bool {
+        let own_level = self.book(request.side).get(&request.price_ticks);
+        if !own_level.is_some_and(|level| {
+            level
+                .total_quantity
+                .checked_add(request.quantity_lots)
+                .is_none()
+        }) {
+            return false;
+        }
+        let mut remaining = u128::from(request.quantity_lots);
+        let opposite = self.book(match request.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        });
+        let prices: Box<dyn Iterator<Item = (&PriceTicks, &PriceLevel)> + '_> = match request.side {
+            Side::Buy => Box::new(
+                opposite
+                    .iter()
+                    .take_while(move |(price, _)| **price <= request.price_ticks),
+            ),
+            Side::Sell => Box::new(
+                opposite
+                    .iter()
+                    .rev()
+                    .take_while(move |(price, _)| **price >= request.price_ticks),
+            ),
+        };
+        for (_, level) in prices {
+            let mut next = level.head;
+            while let Some(order_id) = next {
+                let maker = self
+                    .live_orders
+                    .get(&order_id)
+                    .expect("level points to a live order");
+                remaining = remaining.saturating_sub(u128::from(maker.remaining_lots));
+                if remaining == 0 {
+                    return false;
+                }
+                next = maker.next;
+            }
+        }
+        let remainder =
+            u64::try_from(remaining).expect("remaining cannot exceed submitted quantity");
+        own_level
+            .expect("overflow precondition includes an existing level")
+            .total_quantity
+            .checked_add(remainder)
+            .is_none()
+    }
     fn book(&self, side: Side) -> &BTreeMap<PriceTicks, PriceLevel> {
         match side {
             Side::Buy => &self.bids,
@@ -410,7 +465,10 @@ impl MatchingEngine {
             level.head = Some(order.order_id);
         }
         level.tail = Some(order.order_id);
-        level.total_quantity += order.remaining_lots;
+        level.total_quantity = level
+            .total_quantity
+            .checked_add(order.remaining_lots)
+            .expect("submit preflight rejects aggregate quantity overflow");
         self.live_orders.insert(
             order.order_id,
             LiveOrder {
@@ -596,6 +654,22 @@ mod tests {
             vec![1, 3, 4]
         );
         assert_eq!(engine.live_order_count(), 0);
+        assert!(engine.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn aggregate_level_quantity_overflow_is_rejected_without_mutation() {
+        let mut engine = MatchingEngine::new();
+        assert!(engine
+            .submit(order(1, Side::Buy, 100, u64::MAX))
+            .rejection
+            .is_none());
+        let before = engine.state_fingerprint();
+        assert_eq!(
+            engine.submit(order(2, Side::Buy, 100, 1)).rejection,
+            Some(RejectReason::AggregateQuantityOverflow)
+        );
+        assert_eq!(engine.state_fingerprint(), before);
         assert!(engine.check_invariants().is_ok());
     }
 
