@@ -1,4 +1,8 @@
-use equity_matching_engine::{benchmark, ibkr, pipeline, MatchingEngine, OrderRequest, Side};
+use equity_matching_engine::{
+    benchmark, ibkr, pipeline, replay, MatchingEngine, OrderRequest, Side,
+};
+use std::fs::File;
+use std::io::{stdin, stdout, BufReader};
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("ibkr-capture") {
@@ -9,6 +13,74 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+    if std::env::args().nth(1).as_deref() == Some("market-replay") {
+        let mut input = None;
+        let mut speed = 1000.0_f64;
+        let mut step = false;
+        let mut expected_events: Option<u64> = None;
+        let mut expected_checksum: Option<u64> = None;
+        let mut args = std::env::args().skip(2);
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--input" => input = args.next(),
+                "--speed" => {
+                    speed = args
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage())
+                }
+                "--step" => step = true,
+                "--expected-events" => {
+                    expected_events = Some(
+                        args.next()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or_else(|| usage()),
+                    )
+                }
+                "--expected-checksum" => {
+                    expected_checksum = Some(
+                        args.next()
+                            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                            .unwrap_or_else(|| usage()),
+                    )
+                }
+                _ => usage(),
+            }
+        }
+        let input = input.unwrap_or_else(|| usage());
+        let file = File::open(&input).unwrap_or_else(|error| {
+            eprintln!("cannot open {input}: {error}");
+            std::process::exit(1);
+        });
+        let summary = replay::replay_reader(
+            BufReader::new(file),
+            stdin().lock(),
+            &mut stdout().lock(),
+            replay::ReplayOptions { speed, step },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("market replay failed: {error}");
+            std::process::exit(1);
+        });
+        if expected_events.is_some_and(|expected| expected != summary.events_applied) {
+            eprintln!(
+                "event count mismatch: expected {}, applied {}",
+                expected_events.unwrap(),
+                summary.events_applied
+            );
+            std::process::exit(1);
+        }
+        if expected_checksum.is_some_and(|expected| expected != summary.checksum) {
+            eprintln!(
+                "event checksum mismatch: expected {:016x}, got {:016x}",
+                expected_checksum.unwrap(),
+                summary.checksum
+            );
+            std::process::exit(1);
+        }
+        println!("\nevents_applied={},checksum={:016x},state_fingerprint={:016x},quotes={},depth_events={},gaps={},out_of_order_receive_timestamps={},incomplete={},stopped_by_user={}", summary.events_applied, summary.checksum, summary.state_fingerprint, summary.quotes, summary.depth_updates, summary.gaps, summary.out_of_order_receive_timestamps, summary.incomplete, summary.stopped_by_user);
+        return;
     }
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("benchmark") {
@@ -187,6 +259,6 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark [options]");
+    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|ibkr-capture|market-replay [options]");
     std::process::exit(2);
 }

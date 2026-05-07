@@ -384,6 +384,18 @@ pub fn capture(config: Config) -> Result<(), String> {
     let mut ordinal = 0_u64;
     let mut quote = L1Normalizer::default();
     let mut failure = None;
+    let session_id = format!("{}-{stamp}", config.symbol);
+    if let Err(error) = send_event(
+        &sender,
+        &mut ordinal,
+        &config,
+        MarketPayload::SessionStart {
+            session_id: session_id.clone(),
+        },
+        None,
+    ) {
+        failure = Some(error);
+    }
     if let Err(error) = send_event(
         &sender,
         &mut ordinal,
@@ -478,6 +490,20 @@ pub fn capture(config: Config) -> Result<(), String> {
             std::thread::yield_now();
         }
     }
+    if failure.is_none() {
+        if let Err(error) = send_event(
+            &sender,
+            &mut ordinal,
+            &config,
+            MarketPayload::SessionEnd {
+                session_id: session_id.clone(),
+                complete: true,
+            },
+            None,
+        ) {
+            failure = Some(error);
+        }
+    }
     drop(sender);
     let written = writer
         .join()
@@ -556,6 +582,17 @@ fn append_incomplete_markers(
             MarketPayload::DepthGap {
                 venue: config.exchange.clone(),
                 reason: reason.into(),
+            },
+            None,
+        ),
+        MarketEvent::from_source(
+            ordinal + 2,
+            &config.symbol,
+            "IBKR",
+            time,
+            MarketPayload::SessionEnd {
+                session_id: format!("{}-incomplete", config.symbol),
+                complete: false,
             },
             None,
         ),
