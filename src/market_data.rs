@@ -4,7 +4,7 @@
 //! callbacks into these versioned, locally ordered records.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 
 pub const MARKET_EVENT_SCHEMA_VERSION: u16 = 2;
@@ -182,6 +182,10 @@ pub enum MarketReplayError {
         ordinal: u64,
         reason: String,
     },
+    InvalidSessionTransition {
+        ordinal: u64,
+        session_id: String,
+    },
 }
 
 impl std::fmt::Display for MarketReplayError {
@@ -209,6 +213,13 @@ impl std::fmt::Display for MarketReplayError {
             Self::InvalidMarketValue { ordinal, reason } => {
                 write!(f, "event {ordinal} has invalid market value: {reason}")
             }
+            Self::InvalidSessionTransition {
+                ordinal,
+                session_id,
+            } => write!(
+                f,
+                "event {ordinal} has invalid transition for session {session_id}"
+            ),
         }
     }
 }
@@ -222,6 +233,7 @@ pub struct MarketReplay {
     depth: HashMap<(String, String), DepthBook>,
     disconnected_feeds: HashMap<String, String>,
     saw_gap: bool,
+    open_sessions: HashSet<String>,
 }
 
 impl MarketReplay {
@@ -284,8 +296,24 @@ impl MarketReplay {
                 state.last_receive_time_ns = Some(event.receive_time_ns);
             }
             MarketPayload::OtherTick { .. } => {}
-            MarketPayload::SessionStart { .. } => {}
-            MarketPayload::SessionEnd { complete, .. } => {
+            MarketPayload::SessionStart { session_id } => {
+                if !self.open_sessions.insert(session_id.clone()) {
+                    return Err(MarketReplayError::InvalidSessionTransition {
+                        ordinal: event.ordinal,
+                        session_id: session_id.clone(),
+                    });
+                }
+            }
+            MarketPayload::SessionEnd {
+                session_id,
+                complete,
+            } => {
+                if !self.open_sessions.remove(session_id) {
+                    return Err(MarketReplayError::InvalidSessionTransition {
+                        ordinal: event.ordinal,
+                        session_id: session_id.clone(),
+                    });
+                }
                 if !complete {
                     self.saw_gap = true;
                 }
@@ -409,7 +437,9 @@ impl MarketReplay {
     }
 
     pub fn has_incomplete_data(&self) -> bool {
-        self.saw_gap || self.depth.values().any(|book| !book.valid)
+        self.saw_gap
+            || !self.open_sessions.is_empty()
+            || self.depth.values().any(|book| !book.valid)
     }
 
     pub fn state_fingerprint(&self) -> u64 {
@@ -433,6 +463,12 @@ impl MarketReplay {
         }
         let mut hash = 0xcbf29ce484222325_u64;
         add(&mut hash, &self.next_ordinal.to_le_bytes());
+        add(&mut hash, &[u8::from(self.saw_gap)]);
+        let mut sessions: Vec<_> = self.open_sessions.iter().collect();
+        sessions.sort_unstable();
+        for session in sessions {
+            add_str(&mut hash, session);
+        }
         let mut instruments: Vec<_> = self.level1.iter().collect();
         instruments.sort_by_key(|(instrument, _)| *instrument);
         for (instrument, state) in instruments {

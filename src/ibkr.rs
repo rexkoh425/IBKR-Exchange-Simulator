@@ -348,21 +348,6 @@ pub fn capture(config: Config) -> Result<(), String> {
     let path = config
         .capture_dir
         .join(format!("{}-{stamp}.jsonl", config.symbol));
-    let out =
-        BufWriter::with_capacity(1024 * 1024, File::create(&path).map_err(|e| e.to_string())?);
-    let (sender, receiver) = sync_channel::<MarketEvent>(config.queue_capacity);
-    let writer = std::thread::spawn(move || -> Result<u64, String> {
-        let mut out = out;
-        let mut written = 0_u64;
-        while let Ok(event) = receiver.recv() {
-            serde_json::to_writer(&mut out, &event).map_err(|e| e.to_string())?;
-            out.write_all(b"\n").map_err(|e| e.to_string())?;
-            written = event.ordinal;
-        }
-        out.flush().map_err(|e| e.to_string())?;
-        Ok(written)
-    });
-
     let address = format!("{}:{}", config.host, config.port);
     let client = Client::connect(&address, config.client_id)
         .map_err(|e| format!("IBKR connect failed: {e}"))?;
@@ -379,6 +364,21 @@ pub fn capture(config: Config) -> Result<(), String> {
         .smart_depth(SmartDepth::No)
         .subscribe()
         .map_err(|e| format!("IBKR depth subscription failed: {e}"))?;
+
+    let out =
+        BufWriter::with_capacity(1024 * 1024, File::create(&path).map_err(|e| e.to_string())?);
+    let (sender, receiver) = sync_channel::<MarketEvent>(config.queue_capacity);
+    let writer = std::thread::spawn(move || -> Result<u64, String> {
+        let mut out = out;
+        let mut written = 0_u64;
+        while let Ok(event) = receiver.recv() {
+            serde_json::to_writer(&mut out, &event).map_err(|e| e.to_string())?;
+            out.write_all(b"\n").map_err(|e| e.to_string())?;
+            written = event.ordinal;
+        }
+        out.flush().map_err(|e| e.to_string())?;
+        Ok(written)
+    });
 
     let started = Instant::now();
     let mut ordinal = 0_u64;
@@ -509,7 +509,7 @@ pub fn capture(config: Config) -> Result<(), String> {
         .join()
         .map_err(|_| "capture writer panicked".to_owned())??;
     if let Some(reason) = failure {
-        append_incomplete_markers(&path, written + 1, &config, &reason)?;
+        append_incomplete_markers(&path, written + 1, &config, &session_id, &reason)?;
         eprintln!(
             "capture stopped with incomplete session after {written} normalized events: {reason}"
         );
@@ -550,6 +550,7 @@ fn append_incomplete_markers(
     path: &std::path::Path,
     ordinal: u64,
     config: &Config,
+    session_id: &str,
     reason: &str,
 ) -> Result<(), String> {
     let file = OpenOptions::new()
@@ -591,7 +592,7 @@ fn append_incomplete_markers(
             "IBKR",
             time,
             MarketPayload::SessionEnd {
-                session_id: format!("{}-incomplete", config.symbol),
+                session_id: session_id.to_owned(),
                 complete: false,
             },
             None,
@@ -725,5 +726,56 @@ mod tests {
             crate::market_data::read_jsonl(std::io::Cursor::new(bytes)).unwrap(),
             vec![event]
         );
+    }
+
+    #[test]
+    fn incomplete_capture_markers_preserve_ordinal_order_and_open_session() {
+        let path = std::env::temp_dir().join(format!(
+            "ibkr-gap-test-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = Config {
+            host: "127.0.0.1".into(),
+            port: 4002,
+            client_id: 1,
+            symbol: "AAPL".into(),
+            currency: "USD".into(),
+            exchange: "SMART".into(),
+            depth_rows: 5,
+            tick_size: 0.01,
+            capture_dir: std::env::temp_dir(),
+            seconds: 1,
+            queue_capacity: 4,
+        };
+        let mut file = BufWriter::new(File::create(&path).unwrap());
+        let start = MarketEvent::from_source(
+            1,
+            "AAPL",
+            "IBKR",
+            1,
+            MarketPayload::SessionStart {
+                session_id: "s1".into(),
+            },
+            None,
+        );
+        crate::market_data::write_jsonl(&mut file, &[start]).unwrap();
+        file.flush().unwrap();
+        append_incomplete_markers(&path, 2, &config, "s1", "buffer overflow").unwrap();
+        let events =
+            crate::market_data::read_jsonl(std::io::BufReader::new(File::open(&path).unwrap()))
+                .unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.ordinal).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        let mut replay = crate::market_data::MarketReplay::new();
+        for event in &events {
+            replay.apply(event).unwrap();
+        }
+        assert!(replay.has_incomplete_data());
+        let _ = fs::remove_file(path);
     }
 }
