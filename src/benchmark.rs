@@ -31,6 +31,7 @@ pub struct TrialResult {
     pub p50_service_ns: u64,
     pub p95_service_ns: u64,
     pub p99_service_ns: u64,
+    pub p999_service_ns: u64,
     pub max_service_ns: u64,
     pub final_state_fingerprint: u64,
 }
@@ -70,6 +71,7 @@ pub fn run_trial(event_count: usize, seed: u64) -> TrialResult {
         p50_service_ns: percentile(&service_times, 50),
         p95_service_ns: percentile(&service_times, 95),
         p99_service_ns: percentile(&service_times, 99),
+        p999_service_ns: percentile(&service_times, 999),
         max_service_ns: service_times.last().copied().unwrap_or(0),
         final_state_fingerprint: engine.state_fingerprint(),
     }

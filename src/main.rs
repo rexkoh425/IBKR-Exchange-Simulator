@@ -117,11 +117,11 @@ fn main() {
         {
             eprintln!("rustc={}", String::from_utf8_lossy(&version.stdout).trim());
         }
-        println!("trial,seed,events,submits,cancels,trades,matched_lots,elapsed_seconds,completed_events_per_second,p50_service_ns,p95_service_ns,p99_service_ns,max_service_ns,final_state_fingerprint");
+        println!("trial,seed,events,submits,cancels,trades,matched_lots,elapsed_seconds,completed_events_per_second,p50_service_ns,p95_service_ns,p99_service_ns,p999_service_ns,max_service_ns,final_state_fingerprint");
         for trial in 1..=trials {
             let result = benchmark::run_trial(events, seed);
             println!(
-                "{trial},{},{},{},{},{},{},{:.6},{:.2},{},{},{},{},{}",
+                "{trial},{},{},{},{},{},{},{:.6},{:.2},{},{},{},{},{},{}",
                 result.seed,
                 result.events,
                 result.submit_count,
@@ -133,6 +133,7 @@ fn main() {
                 result.p50_service_ns,
                 result.p95_service_ns,
                 result.p99_service_ns,
+                result.p999_service_ns,
                 result.max_service_ns,
                 result.final_state_fingerprint
             );
