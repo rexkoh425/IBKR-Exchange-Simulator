@@ -71,7 +71,7 @@ pub fn run_trial(event_count: usize, seed: u64) -> TrialResult {
         p50_service_ns: percentile(&service_times, 50),
         p95_service_ns: percentile(&service_times, 95),
         p99_service_ns: percentile(&service_times, 99),
-        p999_service_ns: percentile(&service_times, 999),
+        p999_service_ns: percentile_per_mille(&service_times, 999),
         max_service_ns: service_times.last().copied().unwrap_or(0),
         final_state_fingerprint: engine.state_fingerprint(),
     }
@@ -82,6 +82,17 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
         return 0;
     }
     let rank = (percentile * sorted.len()).div_ceil(100).max(1);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn percentile_per_mille(sorted: &[u64], per_mille: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = per_mille
+        .saturating_mul(sorted.len())
+        .div_ceil(1_000)
+        .max(1);
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
