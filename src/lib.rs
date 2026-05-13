@@ -44,7 +44,6 @@ pub enum RejectReason {
     InvalidPrice,
     InvalidQuantity,
     DuplicateOrderId,
-    AggregateQuantityOverflow,
     UnknownOrderId,
     SequenceExhausted,
 }
@@ -88,7 +87,7 @@ pub struct ReplaceResult {
 struct PriceLevel {
     head: Option<OrderId>,
     tail: Option<OrderId>,
-    total_quantity: QuantityLots,
+    total_quantity: u128,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,9 +124,6 @@ impl MatchingEngine {
         }
         if self.used_order_ids.contains(&request.order_id) {
             return SubmitResult::rejected(RejectReason::DuplicateOrderId);
-        }
-        if self.resting_quantity_would_overflow(request) {
-            return SubmitResult::rejected(RejectReason::AggregateQuantityOverflow);
         }
         let Some(sequence) = self.allocate_sequence() else {
             return SubmitResult::rejected(RejectReason::SequenceExhausted);
@@ -181,10 +177,14 @@ impl MatchingEngine {
                     .get_mut(&maker_id)
                     .expect("maker remains live")
                     .remaining_lots -= fill_quantity;
-                self.book_mut(resting_side)
+                let level = self
+                    .book_mut(resting_side)
                     .get_mut(&price)
-                    .expect("price level remains live")
-                    .total_quantity -= fill_quantity;
+                    .expect("price level remains live");
+                level.total_quantity = level
+                    .total_quantity
+                    .checked_sub(u128::from(fill_quantity))
+                    .expect("level aggregate includes this fill");
             }
         }
 
@@ -247,13 +247,13 @@ impl MatchingEngine {
         }
     }
 
-    pub fn best_bid(&self) -> Option<(PriceTicks, QuantityLots)> {
+    pub fn best_bid(&self) -> Option<(PriceTicks, u128)> {
         self.bids
             .iter()
             .next_back()
             .map(|(price, level)| (*price, level.total_quantity))
     }
-    pub fn best_ask(&self) -> Option<(PriceTicks, QuantityLots)> {
+    pub fn best_ask(&self) -> Option<(PriceTicks, u128)> {
         self.asks
             .iter()
             .next()
@@ -338,7 +338,7 @@ impl MatchingEngine {
                 if *price <= 0 || level.head.is_none() || level.tail.is_none() {
                     return Err("book contains an invalid or empty price level".into());
                 }
-                let mut total_quantity = 0;
+                let mut total_quantity = 0_u128;
                 let mut previous = None;
                 let mut current = level.head;
                 while let Some(order_id) = current {
@@ -355,7 +355,9 @@ impl MatchingEngine {
                     if !indexed.insert(order_id) {
                         return Err(format!("order {order_id} appears more than once"));
                     }
-                    total_quantity += order.remaining_lots;
+                    total_quantity = total_quantity
+                        .checked_add(u128::from(order.remaining_lots))
+                        .ok_or_else(|| "price-level aggregate exceeds u128".to_owned())?;
                     previous = Some(order_id);
                     current = order.next;
                 }
@@ -382,56 +384,6 @@ impl MatchingEngine {
         Some(self.next_sequence)
     }
 
-    fn resting_quantity_would_overflow(&self, request: OrderRequest) -> bool {
-        let own_level = self.book(request.side).get(&request.price_ticks);
-        if !own_level.is_some_and(|level| {
-            level
-                .total_quantity
-                .checked_add(request.quantity_lots)
-                .is_none()
-        }) {
-            return false;
-        }
-        let mut remaining = u128::from(request.quantity_lots);
-        let opposite = self.book(match request.side {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
-        });
-        let prices: Box<dyn Iterator<Item = (&PriceTicks, &PriceLevel)> + '_> = match request.side {
-            Side::Buy => Box::new(
-                opposite
-                    .iter()
-                    .take_while(move |(price, _)| **price <= request.price_ticks),
-            ),
-            Side::Sell => Box::new(
-                opposite
-                    .iter()
-                    .rev()
-                    .take_while(move |(price, _)| **price >= request.price_ticks),
-            ),
-        };
-        for (_, level) in prices {
-            let mut next = level.head;
-            while let Some(order_id) = next {
-                let maker = self
-                    .live_orders
-                    .get(&order_id)
-                    .expect("level points to a live order");
-                remaining = remaining.saturating_sub(u128::from(maker.remaining_lots));
-                if remaining == 0 {
-                    return false;
-                }
-                next = maker.next;
-            }
-        }
-        let remainder =
-            u64::try_from(remaining).expect("remaining cannot exceed submitted quantity");
-        own_level
-            .expect("overflow precondition includes an existing level")
-            .total_quantity
-            .checked_add(remainder)
-            .is_none()
-    }
     fn book(&self, side: Side) -> &BTreeMap<PriceTicks, PriceLevel> {
         match side {
             Side::Buy => &self.bids,
@@ -467,8 +419,8 @@ impl MatchingEngine {
         level.tail = Some(order.order_id);
         level.total_quantity = level
             .total_quantity
-            .checked_add(order.remaining_lots)
-            .expect("submit preflight rejects aggregate quantity overflow");
+            .checked_add(u128::from(order.remaining_lots))
+            .expect("live orders at one level cannot exceed a u128 aggregate");
         self.live_orders.insert(
             order.order_id,
             LiveOrder {
@@ -510,7 +462,10 @@ impl MatchingEngine {
         let level = book
             .get_mut(&order.price_ticks)
             .expect("price level exists");
-        level.total_quantity -= order.remaining_lots;
+        level.total_quantity = level
+            .total_quantity
+            .checked_sub(u128::from(order.remaining_lots))
+            .expect("aggregate includes this live order");
         if level.head.is_none() {
             book.remove(&order.price_ticks);
         }
@@ -658,18 +613,18 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_level_quantity_overflow_is_rejected_without_mutation() {
+    fn aggregate_level_quantity_exceeds_single_order_u64_boundary() {
         let mut engine = MatchingEngine::new();
         assert!(engine
             .submit(order(1, Side::Buy, 100, u64::MAX))
             .rejection
             .is_none());
-        let before = engine.state_fingerprint();
-        assert_eq!(
-            engine.submit(order(2, Side::Buy, 100, 1)).rejection,
-            Some(RejectReason::AggregateQuantityOverflow)
-        );
-        assert_eq!(engine.state_fingerprint(), before);
+        assert!(engine
+            .submit(order(2, Side::Buy, 100, 1))
+            .rejection
+            .is_none());
+        assert_eq!(engine.best_bid(), Some((100, u128::from(u64::MAX) + 1)));
+        assert_eq!(engine.resting_orders(Side::Buy, 100).len(), 2);
         assert!(engine.check_invariants().is_ok());
     }
 
@@ -841,7 +796,7 @@ mod tests {
                                 .orders
                                 .iter()
                                 .filter(|o| o.side == Side::Buy && o.price_ticks == p)
-                                .map(|o| o.remaining_lots)
+                                .map(|o| u128::from(o.remaining_lots))
                                 .sum()
                         ))
                 );
@@ -859,7 +814,7 @@ mod tests {
                                 .orders
                                 .iter()
                                 .filter(|o| o.side == Side::Sell && o.price_ticks == p)
-                                .map(|o| o.remaining_lots)
+                                .map(|o| u128::from(o.remaining_lots))
                                 .sum()
                         ))
                 );
