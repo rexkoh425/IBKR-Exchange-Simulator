@@ -87,7 +87,6 @@ pub struct ReplaceResult {
 struct PriceLevel {
     head: Option<OrderId>,
     tail: Option<OrderId>,
-    total_quantity: u128,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,14 +176,6 @@ impl MatchingEngine {
                     .get_mut(&maker_id)
                     .expect("maker remains live")
                     .remaining_lots -= fill_quantity;
-                let level = self
-                    .book_mut(resting_side)
-                    .get_mut(&price)
-                    .expect("price level remains live");
-                level.total_quantity = level
-                    .total_quantity
-                    .checked_sub(u128::from(fill_quantity))
-                    .expect("level aggregate includes this fill");
             }
         }
 
@@ -248,16 +239,12 @@ impl MatchingEngine {
     }
 
     pub fn best_bid(&self) -> Option<(PriceTicks, u128)> {
-        self.bids
-            .iter()
-            .next_back()
-            .map(|(price, level)| (*price, level.total_quantity))
+        let (price, level) = self.bids.iter().next_back()?;
+        Some((*price, self.level_quantity(level)))
     }
     pub fn best_ask(&self) -> Option<(PriceTicks, u128)> {
-        self.asks
-            .iter()
-            .next()
-            .map(|(price, level)| (*price, level.total_quantity))
+        let (price, level) = self.asks.iter().next()?;
+        Some((*price, self.level_quantity(level)))
     }
     pub fn resting_orders(&self, side: Side, price: PriceTicks) -> Vec<RestingOrder> {
         let Some(level) = self.book(side).get(&price) else {
@@ -338,7 +325,6 @@ impl MatchingEngine {
                 if *price <= 0 || level.head.is_none() || level.tail.is_none() {
                     return Err("book contains an invalid or empty price level".into());
                 }
-                let mut total_quantity = 0_u128;
                 let mut previous = None;
                 let mut current = level.head;
                 while let Some(order_id) = current {
@@ -355,16 +341,11 @@ impl MatchingEngine {
                     if !indexed.insert(order_id) {
                         return Err(format!("order {order_id} appears more than once"));
                     }
-                    total_quantity = total_quantity
-                        .checked_add(u128::from(order.remaining_lots))
-                        .ok_or_else(|| "price-level aggregate exceeds u128".to_owned())?;
                     previous = Some(order_id);
                     current = order.next;
                 }
-                if previous != level.tail || total_quantity != level.total_quantity {
-                    return Err(format!(
-                        "price level {price} has inconsistent tail or quantity"
-                    ));
+                if previous != level.tail {
+                    return Err(format!("price level {price} has inconsistent tail"));
                 }
             }
         }
@@ -382,6 +363,22 @@ impl MatchingEngine {
     fn allocate_sequence(&mut self) -> Option<Sequence> {
         self.next_sequence = self.next_sequence.checked_add(1)?;
         Some(self.next_sequence)
+    }
+
+    fn level_quantity(&self, level: &PriceLevel) -> u128 {
+        let mut total = 0_u128;
+        let mut current = level.head;
+        while let Some(order_id) = current {
+            let order = self
+                .live_orders
+                .get(&order_id)
+                .expect("level points to a live order");
+            total = total
+                .checked_add(u128::from(order.remaining_lots))
+                .expect("live-order aggregate fits u128");
+            current = order.next;
+        }
+        total
     }
 
     fn book(&self, side: Side) -> &BTreeMap<PriceTicks, PriceLevel> {
@@ -417,10 +414,6 @@ impl MatchingEngine {
             level.head = Some(order.order_id);
         }
         level.tail = Some(order.order_id);
-        level.total_quantity = level
-            .total_quantity
-            .checked_add(u128::from(order.remaining_lots))
-            .expect("live orders at one level cannot exceed a u128 aggregate");
         self.live_orders.insert(
             order.order_id,
             LiveOrder {
@@ -462,10 +455,6 @@ impl MatchingEngine {
         let level = book
             .get_mut(&order.price_ticks)
             .expect("price level exists");
-        level.total_quantity = level
-            .total_quantity
-            .checked_sub(u128::from(order.remaining_lots))
-            .expect("aggregate includes this live order");
         if level.head.is_none() {
             book.remove(&order.price_ticks);
         }
