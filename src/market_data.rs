@@ -169,6 +169,7 @@ pub enum MarketReplayError {
         expected: u64,
         actual: u64,
     },
+    OrdinalExhausted,
     InvalidDepthPosition {
         ordinal: u64,
         position: usize,
@@ -198,6 +199,7 @@ impl std::fmt::Display for MarketReplayError {
             Self::InvalidOrdinal { expected, actual } => {
                 write!(f, "expected market event ordinal {expected}, got {actual}")
             }
+            Self::OrdinalExhausted => write!(f, "market replay ordinal space exhausted"),
             Self::InvalidDepthPosition {
                 ordinal,
                 position,
@@ -242,7 +244,10 @@ impl MarketReplay {
     }
 
     pub fn apply(&mut self, event: &MarketEvent) -> Result<(), MarketReplayError> {
-        let expected = self.next_ordinal + 1;
+        let expected = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or(MarketReplayError::OrdinalExhausted)?;
         if event.schema_version != MARKET_EVENT_SCHEMA_VERSION {
             return Err(MarketReplayError::UnsupportedSchema {
                 ordinal: event.ordinal,
@@ -255,6 +260,36 @@ impl MarketReplay {
                 actual: event.ordinal,
             });
         }
+        match &event.payload {
+            MarketPayload::Quote {
+                bid_ticks,
+                ask_ticks,
+                ..
+            } if bid_ticks.is_some_and(|price| price <= 0)
+                || ask_ticks.is_some_and(|price| price <= 0) =>
+            {
+                return Err(MarketReplayError::InvalidMarketValue {
+                    ordinal: event.ordinal,
+                    reason: "quote prices must be positive ticks".into(),
+                });
+            }
+            MarketPayload::Trade {
+                price_ticks,
+                quantity_lots,
+            } if *price_ticks <= 0 || *quantity_lots == 0 => {
+                return Err(MarketReplayError::InvalidMarketValue {
+                    ordinal: event.ordinal,
+                    reason: "trade price and quantity must be positive".into(),
+                });
+            }
+            MarketPayload::DepthUpdate { action, .. } => match action {
+                DepthAction::Insert { level, .. } | DepthAction::Update { level, .. } => {
+                    validate_level(event.ordinal, level)?
+                }
+                DepthAction::Delete { .. } => {}
+            },
+            _ => {}
+        }
         self.next_ordinal = event.ordinal;
 
         match &event.payload {
@@ -264,14 +299,6 @@ impl MarketReplay {
                 ask_ticks,
                 ask_lots,
             } => {
-                if bid_ticks.is_some_and(|price| price <= 0)
-                    || ask_ticks.is_some_and(|price| price <= 0)
-                {
-                    return Err(MarketReplayError::InvalidMarketValue {
-                        ordinal: event.ordinal,
-                        reason: "quote prices must be positive ticks".into(),
-                    });
-                }
                 let state = self.level1.entry(event.instrument.clone()).or_default();
                 state.valid = true;
                 state.bid_ticks = *bid_ticks;
@@ -284,12 +311,6 @@ impl MarketReplay {
                 price_ticks,
                 quantity_lots,
             } => {
-                if *price_ticks <= 0 || *quantity_lots == 0 {
-                    return Err(MarketReplayError::InvalidMarketValue {
-                        ordinal: event.ordinal,
-                        reason: "trade price and quantity must be positive".into(),
-                    });
-                }
                 let state = self.level1.entry(event.instrument.clone()).or_default();
                 state.valid = true;
                 state.last_trade = Some((*price_ticks, *quantity_lots));
@@ -842,5 +863,34 @@ mod tests {
         }
         assert!(!replay.level1("AAPL").unwrap().valid);
         assert_eq!(replay.feed_disconnect_reason("l1"), Some("connection lost"));
+    }
+
+    #[test]
+    fn invalid_market_value_does_not_advance_replay_ordinal() {
+        let mut replay = MarketReplay::new();
+        let invalid = event(
+            1,
+            MarketPayload::Quote {
+                bid_ticks: Some(0),
+                bid_lots: 1,
+                ask_ticks: Some(101),
+                ask_lots: 1,
+            },
+        );
+        assert!(matches!(
+            replay.apply(&invalid),
+            Err(MarketReplayError::InvalidMarketValue { .. })
+        ));
+        let valid = event(
+            1,
+            MarketPayload::Quote {
+                bid_ticks: Some(100),
+                bid_lots: 1,
+                ask_ticks: Some(101),
+                ask_lots: 1,
+            },
+        );
+        assert!(replay.apply(&valid).is_ok());
+        assert_eq!(replay.level1("AAPL").unwrap().bid_ticks, Some(100));
     }
 }
