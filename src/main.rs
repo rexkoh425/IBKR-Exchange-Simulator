@@ -208,12 +208,12 @@ fn main() {
             "warmup_events={},warmup_completed={},warmup_p99_ns={}",
             warmup.events_offered, warmup.events_completed, warmup.p99_end_to_end_ns
         );
-        println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,producer_pin_succeeded,consumer_pin_succeeded,high_water_mark,p50_scheduled_to_complete_ns,p95_scheduled_to_complete_ns,p99_scheduled_to_complete_ns,max_scheduled_to_complete_ns,p99_queue_residence_ns,max_queue_residence_ns,checksum");
+        println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,producer_pin_succeeded,consumer_pin_succeeded,high_water_mark,p50_scheduled_to_complete_ns,p95_scheduled_to_complete_ns,p99_scheduled_to_complete_ns,p999_scheduled_to_complete_ns,max_scheduled_to_complete_ns,p99_queue_residence_ns,p999_queue_residence_ns,max_queue_residence_ns,checksum");
         for trial in 1..=trials {
             let seed = 2026 + trial as u64;
             let result = run(events, seed);
             println!(
-                "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{}",
+                "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 result.events_offered,
                 result.events_completed,
                 result.capacity,
@@ -226,8 +226,10 @@ fn main() {
                 result.p50_end_to_end_ns,
                 result.p95_end_to_end_ns,
                 result.p99_end_to_end_ns,
+                result.p999_end_to_end_ns,
                 result.max_end_to_end_ns,
                 result.p99_queue_residence_ns,
+                result.p999_queue_residence_ns,
                 result.max_queue_residence_ns,
                 result.checksum
             );

@@ -16,8 +16,10 @@ pub struct PipelineResult {
     pub p50_end_to_end_ns: u64,
     pub p95_end_to_end_ns: u64,
     pub p99_end_to_end_ns: u64,
+    pub p999_end_to_end_ns: u64,
     pub max_end_to_end_ns: u64,
     pub p99_queue_residence_ns: u64,
+    pub p999_queue_residence_ns: u64,
     pub max_queue_residence_ns: u64,
     pub high_water_mark: usize,
     pub checksum: u64,
@@ -137,8 +139,10 @@ pub fn run_trial_with_affinity(
         p50_end_to_end_ns: percentile(&latencies, 50),
         p95_end_to_end_ns: percentile(&latencies, 95),
         p99_end_to_end_ns: percentile(&latencies, 99),
+        p999_end_to_end_ns: percentile_per_mille(&latencies, 999),
         max_end_to_end_ns: latencies.last().copied().unwrap_or(0),
         p99_queue_residence_ns: percentile(&queue_residences, 99),
+        p999_queue_residence_ns: percentile_per_mille(&queue_residences, 999),
         max_queue_residence_ns: queue_residences.last().copied().unwrap_or(0),
         // std::sync::mpsc::SyncSender does not expose queue occupancy. The
         // configured hard bound is known; occupancy instrumentation is a later phase.
@@ -251,8 +255,10 @@ pub fn run_spsc_trial_with_affinity(
         p50_end_to_end_ns: percentile(&latencies, 50),
         p95_end_to_end_ns: percentile(&latencies, 95),
         p99_end_to_end_ns: percentile(&latencies, 99),
+        p999_end_to_end_ns: percentile_per_mille(&latencies, 999),
         max_end_to_end_ns: latencies.last().copied().unwrap_or(0),
         p99_queue_residence_ns: percentile(&queue_residences, 99),
+        p999_queue_residence_ns: percentile_per_mille(&queue_residences, 999),
         max_queue_residence_ns: queue_residences.last().copied().unwrap_or(0),
         high_water_mark: high_water,
         checksum,
@@ -270,6 +276,17 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
         return 0;
     }
     let rank = (percentile * sorted.len()).div_ceil(100).max(1);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn percentile_per_mille(sorted: &[u64], per_mille: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = per_mille
+        .saturating_mul(sorted.len())
+        .div_ceil(1_000)
+        .max(1);
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
