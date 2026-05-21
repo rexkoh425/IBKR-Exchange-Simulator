@@ -11,6 +11,7 @@ pub type QuantityLots = u64;
 pub mod benchmark;
 pub mod eventlog;
 pub mod ibkr;
+pub mod market_benchmark;
 pub mod market_data;
 pub mod pipeline;
 pub mod replay;

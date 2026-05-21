@@ -172,7 +172,30 @@ pub fn run_spsc_trial_with_affinity(
     producer_core: Option<usize>,
     consumer_core: Option<usize>,
 ) -> PipelineResult {
+    run_spsc_trial_with_affinity_and_sampling(
+        event_count,
+        offered_rate,
+        capacity,
+        seed,
+        producer_core,
+        consumer_core,
+        64,
+    )
+}
+
+/// SPSC trial with configurable queue occupancy sampling. A value of one
+/// samples every push; larger values reduce telemetry reads on the hot path.
+pub fn run_spsc_trial_with_affinity_and_sampling(
+    event_count: usize,
+    offered_rate: u64,
+    capacity: usize,
+    seed: u64,
+    producer_core: Option<usize>,
+    consumer_core: Option<usize>,
+    occupancy_sample_interval: usize,
+) -> PipelineResult {
     assert!(event_count > 0 && offered_rate > 0 && capacity > 0);
+    assert!(occupancy_sample_interval > 0);
     let payloads = generate_payloads(event_count, seed);
     let expected_checksum = payloads
         .iter()
@@ -241,7 +264,12 @@ pub fn run_spsc_trial_with_affinity(
                 Err(rtrb::PushError::Full(_)) => std::hint::spin_loop(),
             }
         }
-        high_water = high_water.max(capacity - producer.slots());
+        // `slots()` performs an Acquire load of the consumer index. Sampling
+        // occupancy bounds the telemetry cost; the reported peak can miss
+        // short-lived peaks between samples.
+        if index % occupancy_sample_interval == 0 {
+            high_water = high_water.max(capacity - producer.slots());
+        }
     }
     let (events_completed, checksum, latencies, queue_residences, elapsed, consumer_pin_succeeded) =
         worker.join().expect("SPSC worker panicked");

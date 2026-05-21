@@ -1,5 +1,5 @@
 use equity_matching_engine::{
-    benchmark, ibkr, pipeline, replay, MatchingEngine, OrderRequest, Side,
+    benchmark, ibkr, market_benchmark, pipeline, replay, MatchingEngine, OrderRequest, Side,
 };
 use std::fs::File;
 use std::io::{stdin, stdout, BufReader};
@@ -82,6 +82,73 @@ fn main() {
         println!("\nevents_applied={},checksum={:016x},state_fingerprint={:016x},quotes={},depth_events={},gaps={},out_of_order_receive_timestamps={},incomplete={},stopped_by_user={}", summary.events_applied, summary.checksum, summary.state_fingerprint, summary.quotes, summary.depth_updates, summary.gaps, summary.out_of_order_receive_timestamps, summary.incomplete, summary.stopped_by_user);
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("market-data-benchmark") {
+        let mut events = 1_000_000_usize;
+        let mut output = None;
+        let mut args = std::env::args().skip(2);
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--events" => {
+                    events = args
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or_else(|| usage())
+                }
+                "--output" => output = args.next(),
+                _ => usage(),
+            }
+        }
+        if events == 0 {
+            usage();
+        }
+        let output = output.map(std::path::PathBuf::from).unwrap_or_else(|| {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after Unix epoch")
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "market-data-benchmark-{}-{unique}.jsonl",
+                std::process::id()
+            ))
+        });
+        let result = market_benchmark::run(events, &output).unwrap_or_else(|error| {
+            eprintln!("market data benchmark failed: {error}");
+            std::process::exit(1);
+        });
+        eprintln!("output_file={}", output.display());
+        println!("stage,events,elapsed_ns,events_per_second,p50_ns,p95_ns,p99_ns,p999_ns,max_ns");
+        for (name, stage) in [
+            ("normalize", &result.normalization),
+            ("persist_jsonl", &result.persistence),
+            ("decode_jsonl", &result.decode),
+            ("replay", &result.replay),
+            ("in_memory_end_to_end", &result.in_memory_end_to_end),
+        ] {
+            println!(
+                "{name},{},{},{:.2},{},{},{},{},{}",
+                stage.events,
+                stage.elapsed_ns,
+                stage.events_per_second,
+                stage.p50_ns,
+                stage.p95_ns,
+                stage.p99_ns,
+                stage.p999_ns,
+                stage.max_ns
+            );
+        }
+        println!(
+            "summary,source_callbacks={},normalized_events={},file_bytes={},flush_ns={},checksum={:016x},state_fingerprint={:016x},deterministic={},incomplete={}",
+            result.source_callbacks,
+            result.normalized_events,
+            result.file_bytes,
+            result.persistence_flush_ns,
+            result.event_checksum,
+            result.state_fingerprint,
+            result.deterministic_replay,
+            result.incomplete
+        );
+        return;
+    }
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("benchmark") {
         let mut events = 1_000_000_usize;
@@ -149,6 +216,7 @@ fn main() {
         let mut queue = "sync".to_owned();
         let mut producer_core = None;
         let mut consumer_core = None;
+        let mut occupancy_sample_interval = 64_usize;
         let mut args = std::env::args().skip(2);
         while let Some(flag) = args.next() {
             let value = args.next().unwrap_or_else(|| usage());
@@ -165,10 +233,18 @@ fn main() {
                 "--consumer-core" => {
                     consumer_core = Some(value.parse().unwrap_or_else(|_| usage()))
                 }
+                "--occupancy-sample-interval" => {
+                    occupancy_sample_interval = value.parse().unwrap_or_else(|_| usage())
+                }
                 _ => usage(),
             }
         }
-        if events == 0 || rate == 0 || capacity == 0 || trials == 0 {
+        if events == 0
+            || rate == 0
+            || capacity == 0
+            || trials == 0
+            || occupancy_sample_interval == 0
+        {
             usage();
         }
         if queue != "sync" && queue != "spsc" {
@@ -184,13 +260,14 @@ fn main() {
         );
         let run = |count, seed| {
             if queue == "spsc" {
-                pipeline::run_spsc_trial_with_affinity(
+                pipeline::run_spsc_trial_with_affinity_and_sampling(
                     count,
                     rate,
                     capacity,
                     seed,
                     producer_core,
                     consumer_core,
+                    occupancy_sample_interval,
                 )
             } else {
                 pipeline::run_trial_with_affinity(
@@ -208,12 +285,12 @@ fn main() {
             "warmup_events={},warmup_completed={},warmup_p99_ns={}",
             warmup.events_offered, warmup.events_completed, warmup.p99_end_to_end_ns
         );
-        println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,producer_pin_succeeded,consumer_pin_succeeded,high_water_mark,p50_scheduled_to_complete_ns,p95_scheduled_to_complete_ns,p99_scheduled_to_complete_ns,p999_scheduled_to_complete_ns,max_scheduled_to_complete_ns,p99_queue_residence_ns,p999_queue_residence_ns,max_queue_residence_ns,checksum");
+        println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,producer_pin_succeeded,consumer_pin_succeeded,occupancy_sample_interval,high_water_mark,p50_scheduled_to_complete_ns,p95_scheduled_to_complete_ns,p99_scheduled_to_complete_ns,p999_scheduled_to_complete_ns,max_scheduled_to_complete_ns,p99_queue_residence_ns,p999_queue_residence_ns,max_queue_residence_ns,checksum");
         for trial in 1..=trials {
             let seed = 2026 + trial as u64;
             let result = run(events, seed);
             println!(
-                "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 result.events_offered,
                 result.events_completed,
                 result.capacity,
@@ -222,6 +299,11 @@ fn main() {
                 result.zero_loss,
                 result.producer_pin_succeeded,
                 result.consumer_pin_succeeded,
+                if queue == "spsc" {
+                    occupancy_sample_interval
+                } else {
+                    0
+                },
                 result.high_water_mark,
                 result.p50_end_to_end_ns,
                 result.p95_end_to_end_ns,
@@ -262,6 +344,6 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|ibkr-capture|market-replay [options]");
+    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|market-data-benchmark|ibkr-capture|market-replay [options]");
     std::process::exit(2);
 }
