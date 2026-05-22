@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 pub struct PipelineResult {
     pub events_offered: usize,
     pub events_completed: usize,
+    pub ordering_errors: usize,
+    pub queue_full_retries: Option<usize>,
     pub capacity: usize,
     pub offered_events_per_second: u64,
     pub completed_events_per_second: f64,
@@ -29,6 +31,7 @@ pub struct PipelineResult {
 
 #[derive(Debug)]
 struct PipelineEvent {
+    sequence: usize,
     scheduled_offset_ns: u64,
     enqueued_offset_ns: u64,
     payload: u64,
@@ -58,9 +61,7 @@ pub fn run_trial_with_affinity(
     assert!(capacity > 0, "queue capacity must be positive");
 
     let payloads = generate_payloads(event_count, seed);
-    let expected_checksum = payloads
-        .iter()
-        .fold(0_u64, |sum, value| sum.wrapping_add(*value));
+    let expected_checksum = expected_checksum(&payloads);
     let (sender, receiver) = sync_channel::<PipelineEvent>(capacity);
     let barrier = Arc::new(Barrier::new(2));
     let shared_start = Arc::new(OnceLock::<Instant>::new());
@@ -75,6 +76,7 @@ pub fn run_trial_with_affinity(
         let mut queue_residences = Vec::with_capacity(event_count);
         let mut checksum = 0_u64;
         let mut completed = 0;
+        let mut ordering_errors = 0;
         worker_barrier.wait();
         let start = loop {
             if let Some(start) = worker_start.get() {
@@ -87,12 +89,15 @@ pub fn run_trial_with_affinity(
             let completion_offset = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             latencies.push(completion_offset.saturating_sub(event.scheduled_offset_ns));
             queue_residences.push(completion_offset.saturating_sub(event.enqueued_offset_ns));
-            checksum = checksum.wrapping_add(event.payload);
+            if event.sequence != completed {
+                ordering_errors += 1;
+            }
+            checksum = update_checksum(checksum, event.sequence, event.payload);
             completed += 1;
         }
+        let drained_at = start.elapsed();
         latencies.sort_unstable();
         queue_residences.sort_unstable();
-        let drained_at = start.elapsed();
         (
             completed,
             checksum,
@@ -100,6 +105,7 @@ pub fn run_trial_with_affinity(
             queue_residences,
             drained_at,
             consumer_pin_succeeded,
+            ordering_errors,
         )
     });
 
@@ -119,6 +125,7 @@ pub fn run_trial_with_affinity(
         let enqueued_offset_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         sender
             .send(PipelineEvent {
+                sequence: index,
                 scheduled_offset_ns: target_ns,
                 enqueued_offset_ns,
                 payload,
@@ -126,16 +133,27 @@ pub fn run_trial_with_affinity(
             .expect("pipeline worker exited early");
     }
     drop(sender);
-    let (events_completed, checksum, latencies, queue_residences, elapsed, consumer_pin_succeeded) =
-        worker.join().expect("pipeline worker panicked");
+    let (
+        events_completed,
+        checksum,
+        latencies,
+        queue_residences,
+        elapsed,
+        consumer_pin_succeeded,
+        ordering_errors,
+    ) = worker.join().expect("pipeline worker panicked");
     let total_events = event_count;
     PipelineResult {
         events_offered: total_events,
         events_completed,
+        ordering_errors,
+        queue_full_retries: None,
         capacity,
         offered_events_per_second: offered_rate,
         completed_events_per_second: events_completed as f64 / elapsed.as_secs_f64(),
-        zero_loss: events_completed == total_events && checksum == expected_checksum,
+        zero_loss: events_completed == total_events
+            && ordering_errors == 0
+            && checksum == expected_checksum,
         p50_end_to_end_ns: percentile(&latencies, 50),
         p95_end_to_end_ns: percentile(&latencies, 95),
         p99_end_to_end_ns: percentile(&latencies, 99),
@@ -194,12 +212,33 @@ pub fn run_spsc_trial_with_affinity_and_sampling(
     consumer_core: Option<usize>,
     occupancy_sample_interval: usize,
 ) -> PipelineResult {
+    run_spsc_trial_with_affinity_sampling_and_burst(
+        event_count,
+        offered_rate,
+        capacity,
+        seed,
+        producer_core,
+        consumer_core,
+        occupancy_sample_interval,
+        1,
+    )
+}
+
+pub fn run_spsc_trial_with_affinity_sampling_and_burst(
+    event_count: usize,
+    offered_rate: u64,
+    capacity: usize,
+    seed: u64,
+    producer_core: Option<usize>,
+    consumer_core: Option<usize>,
+    occupancy_sample_interval: usize,
+    burst_size: usize,
+) -> PipelineResult {
     assert!(event_count > 0 && offered_rate > 0 && capacity > 0);
     assert!(occupancy_sample_interval > 0);
+    assert!(burst_size > 0);
     let payloads = generate_payloads(event_count, seed);
-    let expected_checksum = payloads
-        .iter()
-        .fold(0_u64, |sum, value| sum.wrapping_add(*value));
+    let expected_checksum = expected_checksum(&payloads);
     let (mut producer, mut consumer) = rtrb::RingBuffer::<PipelineEvent>::new(capacity);
     let start_cell = Arc::new(OnceLock::<Instant>::new());
     let consumer_start = start_cell.clone();
@@ -209,6 +248,7 @@ pub fn run_spsc_trial_with_affinity_and_sampling(
         let mut queue_residences = Vec::with_capacity(event_count);
         let mut checksum = 0_u64;
         let mut completed = 0;
+        let mut ordering_errors = 0;
         loop {
             match consumer.pop() {
                 Ok(event) => {
@@ -216,7 +256,10 @@ pub fn run_spsc_trial_with_affinity_and_sampling(
                     let done = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
                     latencies.push(done.saturating_sub(event.scheduled_offset_ns));
                     queue_residences.push(done.saturating_sub(event.enqueued_offset_ns));
-                    checksum = checksum.wrapping_add(event.payload);
+                    if event.sequence != completed {
+                        ordering_errors += 1;
+                    }
+                    checksum = update_checksum(checksum, event.sequence, event.payload);
                     completed += 1;
                 }
                 Err(_) => {
@@ -227,12 +270,12 @@ pub fn run_spsc_trial_with_affinity_and_sampling(
                 }
             }
         }
-        latencies.sort_unstable();
-        queue_residences.sort_unstable();
         let drained_at = consumer_start
             .get()
             .expect("benchmark start initialized")
             .elapsed();
+        latencies.sort_unstable();
+        queue_residences.sort_unstable();
         (
             completed,
             checksum,
@@ -240,14 +283,17 @@ pub fn run_spsc_trial_with_affinity_and_sampling(
             queue_residences,
             drained_at,
             consumer_pin_succeeded,
+            ordering_errors,
         )
     });
     let producer_pin_succeeded = producer_core.map(pin_current_thread).unwrap_or(false);
     let start = Instant::now();
     start_cell.set(start).expect("pipeline start is set once");
     let mut high_water = 0;
+    let mut queue_full_retries = 0;
     for (index, payload) in payloads.into_iter().enumerate() {
-        let target_ns = ((index as u128) * 1_000_000_000_u128 / u128::from(offered_rate))
+        let schedule_index = (index / burst_size) * burst_size;
+        let target_ns = ((schedule_index as u128) * 1_000_000_000_u128 / u128::from(offered_rate))
             .min(u128::from(u64::MAX)) as u64;
         let target = start + Duration::from_nanos(target_ns);
         while Instant::now() < target {
@@ -256,12 +302,16 @@ pub fn run_spsc_trial_with_affinity_and_sampling(
         let enqueued_offset_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         loop {
             match producer.push(PipelineEvent {
+                sequence: index,
                 scheduled_offset_ns: target_ns,
                 enqueued_offset_ns,
                 payload,
             }) {
                 Ok(()) => break,
-                Err(rtrb::PushError::Full(_)) => std::hint::spin_loop(),
+                Err(rtrb::PushError::Full(_)) => {
+                    queue_full_retries += 1;
+                    std::hint::spin_loop()
+                }
             }
         }
         // `slots()` performs an Acquire load of the consumer index. Sampling
@@ -271,15 +321,26 @@ pub fn run_spsc_trial_with_affinity_and_sampling(
             high_water = high_water.max(capacity - producer.slots());
         }
     }
-    let (events_completed, checksum, latencies, queue_residences, elapsed, consumer_pin_succeeded) =
-        worker.join().expect("SPSC worker panicked");
+    let (
+        events_completed,
+        checksum,
+        latencies,
+        queue_residences,
+        elapsed,
+        consumer_pin_succeeded,
+        ordering_errors,
+    ) = worker.join().expect("SPSC worker panicked");
     PipelineResult {
         events_offered: event_count,
         events_completed,
+        ordering_errors,
+        queue_full_retries: Some(queue_full_retries),
         capacity,
         offered_events_per_second: offered_rate,
         completed_events_per_second: events_completed as f64 / elapsed.as_secs_f64(),
-        zero_loss: events_completed == event_count && checksum == expected_checksum,
+        zero_loss: events_completed == event_count
+            && ordering_errors == 0
+            && checksum == expected_checksum,
         p50_end_to_end_ns: percentile(&latencies, 50),
         p95_end_to_end_ns: percentile(&latencies, 95),
         p99_end_to_end_ns: percentile(&latencies, 99),
@@ -331,6 +392,22 @@ fn generate_payloads(event_count: usize, seed: u64) -> Vec<u64> {
         .collect()
 }
 
+fn expected_checksum(payloads: &[u64]) -> u64 {
+    payloads
+        .iter()
+        .enumerate()
+        .fold(0_u64, |checksum, (sequence, payload)| {
+            update_checksum(checksum, sequence, *payload)
+        })
+}
+
+fn update_checksum(checksum: u64, sequence: usize, payload: u64) -> u64 {
+    let event = payload
+        .wrapping_add((sequence as u64).wrapping_mul(0x9e3779b97f4a7c15))
+        .wrapping_mul(0xbf58476d1ce4e5b9);
+    checksum.rotate_left(13) ^ event
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +417,8 @@ mod tests {
         let result = run_trial(10_000, 100_000, 128, 44);
         assert_eq!(result.events_offered, 10_000);
         assert_eq!(result.events_completed, 10_000);
+        assert_eq!(result.ordering_errors, 0);
+        assert_eq!(result.queue_full_retries, None);
         assert!(result.zero_loss);
         assert!(result.completed_events_per_second > 0.0);
         assert!(result.p50_end_to_end_ns <= result.p95_end_to_end_ns);
@@ -351,7 +430,16 @@ mod tests {
     fn bounded_spsc_pipeline_completes_every_event_and_checks_payloads() {
         let result = run_spsc_trial(10_000, 100_000, 128, 44);
         assert_eq!(result.events_completed, 10_000);
+        assert_eq!(result.ordering_errors, 0);
+        assert!(result.queue_full_retries.is_some());
         assert!(result.zero_loss);
         assert!(result.p50_end_to_end_ns <= result.p99_end_to_end_ns);
+    }
+
+    #[test]
+    fn checksum_changes_when_event_order_changes() {
+        let first = update_checksum(update_checksum(0, 0, 11), 1, 22);
+        let reordered = update_checksum(update_checksum(0, 1, 22), 0, 11);
+        assert_ne!(first, reordered);
     }
 }

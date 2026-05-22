@@ -217,6 +217,7 @@ fn main() {
         let mut producer_core = None;
         let mut consumer_core = None;
         let mut occupancy_sample_interval = 64_usize;
+        let mut burst_size = 1_usize;
         let mut args = std::env::args().skip(2);
         while let Some(flag) = args.next() {
             let value = args.next().unwrap_or_else(|| usage());
@@ -236,6 +237,7 @@ fn main() {
                 "--occupancy-sample-interval" => {
                     occupancy_sample_interval = value.parse().unwrap_or_else(|_| usage())
                 }
+                "--burst-size" => burst_size = value.parse().unwrap_or_else(|_| usage()),
                 _ => usage(),
             }
         }
@@ -244,10 +246,14 @@ fn main() {
             || capacity == 0
             || trials == 0
             || occupancy_sample_interval == 0
+            || burst_size == 0
         {
             usage();
         }
         if queue != "sync" && queue != "spsc" {
+            usage();
+        }
+        if queue == "sync" && burst_size != 1 {
             usage();
         }
         eprintln!(
@@ -260,7 +266,7 @@ fn main() {
         );
         let run = |count, seed| {
             if queue == "spsc" {
-                pipeline::run_spsc_trial_with_affinity_and_sampling(
+                pipeline::run_spsc_trial_with_affinity_sampling_and_burst(
                     count,
                     rate,
                     capacity,
@@ -268,6 +274,7 @@ fn main() {
                     producer_core,
                     consumer_core,
                     occupancy_sample_interval,
+                    burst_size,
                 )
             } else {
                 pipeline::run_trial_with_affinity(
@@ -285,12 +292,12 @@ fn main() {
             "warmup_events={},warmup_completed={},warmup_p99_ns={}",
             warmup.events_offered, warmup.events_completed, warmup.p99_end_to_end_ns
         );
-        println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,producer_pin_succeeded,consumer_pin_succeeded,occupancy_sample_interval,high_water_mark,p50_scheduled_to_complete_ns,p95_scheduled_to_complete_ns,p99_scheduled_to_complete_ns,p999_scheduled_to_complete_ns,max_scheduled_to_complete_ns,p99_queue_residence_ns,p999_queue_residence_ns,max_queue_residence_ns,checksum");
+        println!("trial,seed,events_offered,events_completed,capacity,offered_events_per_second,completed_events_per_second,zero_loss,producer_pin_succeeded,consumer_pin_succeeded,occupancy_sample_interval,high_water_mark,p50_scheduled_to_complete_ns,p95_scheduled_to_complete_ns,p99_scheduled_to_complete_ns,p999_scheduled_to_complete_ns,max_scheduled_to_complete_ns,p99_queue_residence_ns,p999_queue_residence_ns,max_queue_residence_ns,checksum,ordering_errors,queue_full_retries,burst_size");
         for trial in 1..=trials {
             let seed = 2026 + trial as u64;
             let result = run(events, seed);
             println!(
-                "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{trial},{seed},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 result.events_offered,
                 result.events_completed,
                 result.capacity,
@@ -313,7 +320,12 @@ fn main() {
                 result.p99_queue_residence_ns,
                 result.p999_queue_residence_ns,
                 result.max_queue_residence_ns,
-                result.checksum
+                result.checksum,
+                result.ordering_errors,
+                result
+                    .queue_full_retries
+                    .map_or_else(String::new, |value| value.to_string()),
+                burst_size
             );
         }
         return;
