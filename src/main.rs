@@ -273,8 +273,10 @@ fn main() {
                     seed,
                     producer_core,
                     consumer_core,
-                    occupancy_sample_interval,
-                    burst_size,
+                    pipeline::SpscBenchmarkOptions {
+                        occupancy_sample_interval,
+                        burst_size,
+                    },
                 )
             } else {
                 pipeline::run_trial_with_affinity(

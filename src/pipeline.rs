@@ -29,6 +29,12 @@ pub struct PipelineResult {
     pub consumer_pin_succeeded: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpscBenchmarkOptions {
+    pub occupancy_sample_interval: usize,
+    pub burst_size: usize,
+}
+
 #[derive(Debug)]
 struct PipelineEvent {
     sequence: usize,
@@ -219,8 +225,10 @@ pub fn run_spsc_trial_with_affinity_and_sampling(
         seed,
         producer_core,
         consumer_core,
-        occupancy_sample_interval,
-        1,
+        SpscBenchmarkOptions {
+            occupancy_sample_interval,
+            burst_size: 1,
+        },
     )
 }
 
@@ -231,12 +239,11 @@ pub fn run_spsc_trial_with_affinity_sampling_and_burst(
     seed: u64,
     producer_core: Option<usize>,
     consumer_core: Option<usize>,
-    occupancy_sample_interval: usize,
-    burst_size: usize,
+    options: SpscBenchmarkOptions,
 ) -> PipelineResult {
     assert!(event_count > 0 && offered_rate > 0 && capacity > 0);
-    assert!(occupancy_sample_interval > 0);
-    assert!(burst_size > 0);
+    assert!(options.occupancy_sample_interval > 0);
+    assert!(options.burst_size > 0);
     let payloads = generate_payloads(event_count, seed);
     let expected_checksum = expected_checksum(&payloads);
     let (mut producer, mut consumer) = rtrb::RingBuffer::<PipelineEvent>::new(capacity);
@@ -292,7 +299,7 @@ pub fn run_spsc_trial_with_affinity_sampling_and_burst(
     let mut high_water = 0;
     let mut queue_full_retries = 0;
     for (index, payload) in payloads.into_iter().enumerate() {
-        let schedule_index = (index / burst_size) * burst_size;
+        let schedule_index = (index / options.burst_size) * options.burst_size;
         let target_ns = ((schedule_index as u128) * 1_000_000_000_u128 / u128::from(offered_rate))
             .min(u128::from(u64::MAX)) as u64;
         let target = start + Duration::from_nanos(target_ns);
@@ -317,7 +324,7 @@ pub fn run_spsc_trial_with_affinity_sampling_and_burst(
         // `slots()` performs an Acquire load of the consumer index. Sampling
         // occupancy bounds the telemetry cost; the reported peak can miss
         // short-lived peaks between samples.
-        if index % occupancy_sample_interval == 0 {
+        if index % options.occupancy_sample_interval == 0 {
             high_water = high_water.max(capacity - producer.slots());
         }
     }
