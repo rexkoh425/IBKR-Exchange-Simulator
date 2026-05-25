@@ -65,6 +65,18 @@ With SPSC producer/consumer pinned to CPUs 0 and 12 and the offer rate set to
 target under that configuration; millisecond maximum outliers remain. Full
 provenance and limits are in
 [`benchmarks/pinned-spsc-10m-2026-11-09.md`](benchmarks/pinned-spsc-10m-2026-11-09.md).
+
+### SPSC telemetry optimization
+
+`pipeline-benchmark --queue spsc` samples queue occupancy every 64 pushes by
+default. Set `--occupancy-sample-interval 1` to measure after every push, or
+`--burst-size 32` to replay 32-event arrival bursts at the configured average
+rate. The benchmark validates count, event order and an order-sensitive
+checksum, and reports full-queue retries. See the [10-trial before/after
+results](benchmarks/pipeline-optimization-2026-11-10.md) and its raw CSV files.
+The measured synthetic throughput improvement does not represent IBKR market
+data throughput; use `market-data-benchmark` for isolated normalization,
+JSONL persistence, decoding and replay stages.
 It does not establish those metrics for the IBKR capture or persistence path.
 
 ## Event log and replay
