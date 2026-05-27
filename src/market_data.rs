@@ -299,7 +299,7 @@ impl MarketReplay {
                 ask_ticks,
                 ask_lots,
             } => {
-                let state = self.level1.entry(event.instrument.clone()).or_default();
+                let state = self.level1_state(&event.instrument);
                 state.valid = true;
                 state.bid_ticks = *bid_ticks;
                 state.bid_lots = *bid_lots;
@@ -311,7 +311,7 @@ impl MarketReplay {
                 price_ticks,
                 quantity_lots,
             } => {
-                let state = self.level1.entry(event.instrument.clone()).or_default();
+                let state = self.level1_state(&event.instrument);
                 state.valid = true;
                 state.last_trade = Some((*price_ticks, *quantity_lots));
                 state.last_receive_time_ns = Some(event.receive_time_ns);
@@ -445,6 +445,16 @@ impl MarketReplay {
             }
         }
         Ok(())
+    }
+
+    fn level1_state(&mut self, instrument: &str) -> &mut Level1State {
+        if self.level1.contains_key(instrument) {
+            return self
+                .level1
+                .get_mut(instrument)
+                .expect("level1 key checked before mutable lookup");
+        }
+        self.level1.entry(instrument.to_owned()).or_default()
     }
 
     pub fn level1(&self, instrument: &str) -> Option<&Level1State> {
