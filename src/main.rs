@@ -149,6 +149,106 @@ fn main() {
         );
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("market-data-spsc-benchmark") {
+        let mut events = 1_000_000_usize;
+        let mut rate = 1_000_000_u64;
+        let mut capacity = 65_536_usize;
+        let mut sample_interval = 64_usize;
+        let mut burst_size = 1_usize;
+        let mut warmup_events = 100_000_usize;
+        let mut producer_core = None;
+        let mut consumer_core = None;
+        let mut retain_raw_payload = true;
+        let mut args = std::env::args().skip(2);
+        while let Some(flag) = args.next() {
+            if flag == "--no-raw-payload" {
+                retain_raw_payload = false;
+                continue;
+            }
+            let value = args.next().unwrap_or_else(|| usage());
+            match flag.as_str() {
+                "--events" => events = value.parse().unwrap_or_else(|_| usage()),
+                "--rate" => rate = value.parse().unwrap_or_else(|_| usage()),
+                "--capacity" => capacity = value.parse().unwrap_or_else(|_| usage()),
+                "--sample-interval" => sample_interval = value.parse().unwrap_or_else(|_| usage()),
+                "--burst-size" => burst_size = value.parse().unwrap_or_else(|_| usage()),
+                "--warmup-events" => warmup_events = value.parse().unwrap_or_else(|_| usage()),
+                "--producer-core" => {
+                    producer_core = Some(value.parse().unwrap_or_else(|_| usage()))
+                }
+                "--consumer-core" => {
+                    consumer_core = Some(value.parse().unwrap_or_else(|_| usage()))
+                }
+                _ => usage(),
+            }
+        }
+        if events == 0 || rate == 0 || capacity == 0 || burst_size == 0 {
+            usage();
+        }
+        let options = |event_count, telemetry| market_benchmark::MarketSpscOptions {
+            events: event_count,
+            offered_rate: rate,
+            capacity,
+            sample_interval: telemetry,
+            burst_size,
+            producer_core,
+            consumer_core,
+            retain_raw_payload,
+        };
+        if warmup_events > 0 {
+            let warmup =
+                market_benchmark::run_spsc(options(warmup_events, 0)).unwrap_or_else(|error| {
+                    eprintln!("market SPSC warmup failed: {error}");
+                    std::process::exit(1);
+                });
+            eprintln!(
+                "warmup_callbacks={},warmup_completed={},warmup_checksum={:016x}",
+                warmup.source_callbacks, warmup.applied_events, warmup.checksum
+            );
+        }
+        let result =
+            market_benchmark::run_spsc(options(events, sample_interval)).unwrap_or_else(|error| {
+                eprintln!("market SPSC benchmark failed: {error}");
+                std::process::exit(1);
+            });
+        eprintln!(
+            "machine={},os={}",
+            std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "unknown".into()),
+            std::env::consts::OS
+        );
+        if let Ok(version) = std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+        {
+            eprintln!("rustc={}", String::from_utf8_lossy(&version.stdout).trim());
+        }
+        println!("metric,value");
+        println!("source_callbacks,{}", result.source_callbacks);
+        println!("queue_events,{}", result.queue_events);
+        println!("applied_events,{}", result.applied_events);
+        println!("capacity,{}", result.capacity);
+        println!("offered_rate,{}", result.offered_rate);
+        println!(
+            "completed_events_per_second,{:.2}",
+            result.completed_events_per_second
+        );
+        println!("queue_full_retries,{}", result.queue_full_retries);
+        println!("sampled_high_water,{}", result.sampled_high_water);
+        println!("producer_pin_succeeded,{}", result.producer_pin_succeeded);
+        println!("consumer_pin_succeeded,{}", result.consumer_pin_succeeded);
+        println!("event_order_errors,{}", result.event_order_errors);
+        println!("checksums_match,{}", result.checksums_match);
+        println!("checksum,{:016x}", result.checksum);
+        println!("state_fingerprint,{:016x}", result.state_fingerprint);
+        println!("incomplete,{}", result.incomplete);
+        print_distribution("producer_release_lateness", &result.release_lateness);
+        print_distribution("normalization", &result.normalization);
+        print_distribution("queue_push", &result.queue_push);
+        print_distribution("queue_residence", &result.queue_residence);
+        print_distribution("consumer_replay", &result.consumer_replay);
+        print_distribution("scheduled_to_completion", &result.scheduled_to_completion);
+        return;
+    }
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("benchmark") {
         let mut events = 1_000_000_usize;
@@ -358,6 +458,18 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|market-data-benchmark|ibkr-capture|market-replay [options]");
+    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|market-data-benchmark|market-data-spsc-benchmark|ibkr-capture|market-replay [options]");
     std::process::exit(2);
+}
+
+fn print_distribution(
+    name: &str,
+    distribution: &equity_matching_engine::market_benchmark::LatencyDistribution,
+) {
+    println!("{name}_samples,{}", distribution.samples);
+    println!("{name}_p50_ns,{}", distribution.p50_ns);
+    println!("{name}_p95_ns,{}", distribution.p95_ns);
+    println!("{name}_p99_ns,{}", distribution.p99_ns);
+    println!("{name}_p999_ns,{}", distribution.p999_ns);
+    println!("{name}_max_ns,{}", distribution.max_ns);
 }
