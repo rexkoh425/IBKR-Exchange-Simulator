@@ -98,9 +98,13 @@ Copy `.env.example` to `.env`, then configure the socket/contract values. Start
 TWS or IB Gateway and log in there; the API client does not take account
 credentials. Run `cargo run --release -- ibkr-capture`. It subscribes to L1 and
 positional market depth and writes timestamped JSONL under `data/ibkr/`. The
-capture currently stores raw SDK debug payloads for inspection; conversion to
-the provider-neutral replay schema is a follow-up. Code 317 depth reset is
-recorded explicitly. Terminal stream errors are logged as gaps. A bounded
+capture stores raw SDK debug payloads for inspection by default. Set
+`IBKR_CAPTURE_RAW_PAYLOAD=false` to skip formatting and writing those raw strings;
+the normalized market events remain, but the JSONL loses the original SDK text
+needed for raw-payload audit/debug inspection. A synthetic paired benchmark
+measured about 98% higher throughput without this formatting, but that is not a
+live IBKR or disk-persistence measurement. Code 317 depth reset is recorded
+explicitly. Terminal stream errors are logged as gaps. A bounded
 writer queue (set by `IBKR_QUEUE_CAPACITY`) moves JSON encoding and disk writes
 off the polling loop. If that queue fills, capture stops and appends a gap
 record after draining queued events; it does not claim a complete capture.

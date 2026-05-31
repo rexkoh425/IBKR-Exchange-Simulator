@@ -25,6 +25,7 @@ pub struct Config {
     pub capture_dir: PathBuf,
     pub seconds: u64,
     pub queue_capacity: usize,
+    pub capture_raw_payload: bool,
 }
 
 impl Config {
@@ -68,6 +69,10 @@ impl Config {
             capture_dir: get("IBKR_CAPTURE_DIR", "data/ibkr").into(),
             seconds: parse_u64("IBKR_SECONDS", "60")?,
             queue_capacity: parse_usize("IBKR_QUEUE_CAPACITY", "65536")?,
+            capture_raw_payload: parse_bool_setting(
+                "IBKR_CAPTURE_RAW_PAYLOAD",
+                &get("IBKR_CAPTURE_RAW_PAYLOAD", "true"),
+            )?,
         };
         if config.port == 0
             || config.depth_rows <= 0
@@ -80,6 +85,12 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+fn parse_bool_setting(key: &str, value: &str) -> Result<bool, String> {
+    value
+        .parse::<bool>()
+        .map_err(|_| format!("invalid {key} (expected true or false)"))
 }
 
 fn load_env_file() -> Result<(), String> {
@@ -420,7 +431,7 @@ pub fn capture(config: Config) -> Result<(), String> {
                                 &mut ordinal,
                                 &config,
                                 payload,
-                                Some(format!("{tick:?}")),
+                                config.capture_raw_payload.then(|| format!("{tick:?}")),
                             ) {
                                 failure = Some(error);
                             }
@@ -438,7 +449,7 @@ pub fn capture(config: Config) -> Result<(), String> {
                         &mut ordinal,
                         &config,
                         payload,
-                        Some(format!("{notice:?}")),
+                        config.capture_raw_payload.then(|| format!("{notice:?}")),
                     ) {
                         failure = Some(error);
                     }
@@ -460,7 +471,7 @@ pub fn capture(config: Config) -> Result<(), String> {
                                 &mut ordinal,
                                 &config,
                                 payload,
-                                Some(format!("{depth:?}")),
+                                config.capture_raw_payload.then(|| format!("{depth:?}")),
                             ) {
                                 failure = Some(error);
                             }
@@ -478,7 +489,7 @@ pub fn capture(config: Config) -> Result<(), String> {
                         &mut ordinal,
                         &config,
                         payload,
-                        Some(format!("{notice:?}")),
+                        config.capture_raw_payload.then(|| format!("{notice:?}")),
                     ) {
                         failure = Some(error);
                     }
@@ -608,6 +619,13 @@ fn append_incomplete_markers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_payload_setting_accepts_only_boolean_values() {
+        assert!(parse_bool_setting("IBKR_CAPTURE_RAW_PAYLOAD", "true").unwrap());
+        assert!(!parse_bool_setting("IBKR_CAPTURE_RAW_PAYLOAD", "false").unwrap());
+        assert!(parse_bool_setting("IBKR_CAPTURE_RAW_PAYLOAD", "yes").is_err());
+    }
     use ibapi::market_data::realtime::{TickPrice, TickSize};
 
     #[test]
@@ -749,6 +767,7 @@ mod tests {
             capture_dir: std::env::temp_dir(),
             seconds: 1,
             queue_capacity: 4,
+            capture_raw_payload: true,
         };
         let mut file = BufWriter::new(File::create(&path).unwrap());
         let start = MarketEvent::from_source(

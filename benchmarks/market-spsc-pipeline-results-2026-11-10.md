@@ -31,6 +31,8 @@ Ten paired 100K-event runs compared the same candidate build with and without sy
 
 This comparison intentionally changes `MarketEvent.raw_payload`; it is not byte-for-byte event equivalence. The IBKR capture loop currently formats raw L1/L2 callback debug text and stores it in JSONL. The result identifies a large optional cost, not an unconditional optimization: retaining raw source data supports audit/debug replay. The benchmark's `--no-raw-payload` flag exists only to measure that tradeoff; it does not alter live capture defaults.
 
+The capture now supports `IBKR_CAPTURE_RAW_PAYLOAD=false` as an explicit opt-in to omit this formatting from live capture. The default remains `true`. This setting changes JSONL audit content and has not been measured against an actual IBKR session or disk writer.
+
 ## Paced load and capacities
 
 One 100K-event characterization run per setting, sample interval 64, capacities 256 / 4,096 / 65,536:
