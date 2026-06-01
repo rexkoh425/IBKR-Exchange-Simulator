@@ -10,6 +10,7 @@ pub type QuantityLots = u64;
 
 pub mod benchmark;
 pub mod eventlog;
+pub mod gateway;
 pub mod ibkr;
 pub mod market_benchmark;
 pub mod market_data;
@@ -18,7 +19,9 @@ pub mod replay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
+    #[serde(alias = "buy")]
     Buy,
+    #[serde(alias = "sell")]
     Sell,
 }
 
@@ -40,7 +43,7 @@ pub struct Trade {
     pub quantity_lots: QuantityLots,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectReason {
     InvalidPrice,
     InvalidQuantity,

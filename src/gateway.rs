@@ -1,0 +1,1057 @@
+//! Deterministic in-process exchange gateway for simulated client order flow.
+//!
+//! Requests are serialized by the caller. `request_id` provides idempotent
+//! retries per client, while client order IDs are unique for the gateway's
+//! lifetime. Replace requests cancel the old order and submit a fresh order,
+//! so they do not inherit time priority.
+
+use crate::{MatchingEngine, OrderRequest, RejectReason, Side, Trade};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, Write};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayConfig {
+    pub max_order_quantity_lots: u64,
+    pub max_order_notional_ticks_lots: u128,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            max_order_quantity_lots: u64::MAX,
+            max_order_notional_ticks_lots: u128::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayRequest {
+    pub client_id: u64,
+    pub request_id: u64,
+    pub command: GatewayCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GatewayCommand {
+    New {
+        client_order_id: u64,
+        side: Side,
+        price_ticks: i64,
+        quantity_lots: u64,
+    },
+    Cancel {
+        client_order_id: u64,
+    },
+    Replace {
+        client_order_id: u64,
+        replacement_client_order_id: u64,
+        price_ticks: i64,
+        quantity_lots: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    Accepted,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "detail", rename_all = "snake_case")]
+pub enum GatewayRejectReason {
+    InvalidClientOrderId,
+    DuplicateClientOrderId,
+    UnknownClientOrderId,
+    OrderNotLive,
+    QuantityLimit,
+    NotionalLimit,
+    Engine(RejectReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionReport {
+    pub report_sequence: u128,
+    pub client_id: u64,
+    pub request_id: u64,
+    pub client_order_id: u64,
+    pub exchange_order_id: Option<u64>,
+    pub engine_sequence: Option<u64>,
+    pub status: OrderStatus,
+    pub side: Option<Side>,
+    pub price_ticks: Option<i64>,
+    pub order_quantity_lots: u64,
+    pub cumulative_quantity_lots: u64,
+    pub leaves_quantity_lots: u64,
+    pub last_quantity_lots: u64,
+    pub last_price_ticks: Option<i64>,
+    pub reject_reason: Option<GatewayRejectReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayResponse {
+    pub client_id: u64,
+    pub request_id: u64,
+    /// True when this response replays a cached result for an identical request.
+    pub replayed: bool,
+    pub reports: Vec<ExecutionReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayError {
+    InvalidRequestId,
+    IdempotencyConflict,
+    ExchangeOrderIdExhausted,
+}
+
+impl std::fmt::Display for GatewayError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequestId => formatter.write_str("request_id must be greater than zero"),
+            Self::IdempotencyConflict => {
+                formatter.write_str("request_id was already used for a different command")
+            }
+            Self::ExchangeOrderIdExhausted => {
+                formatter.write_str("simulated exchange order ID space is exhausted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GatewayError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ClientOrderKey {
+    client_id: u64,
+    client_order_id: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderRecord {
+    exchange_order_id: u64,
+    last_request_id: u64,
+    side: Side,
+    price_ticks: i64,
+    order_quantity_lots: u64,
+    cumulative_quantity_lots: u64,
+    status: OrderStatus,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRequest {
+    command: GatewayCommand,
+    reports: Vec<ExecutionReport>,
+}
+
+#[derive(Debug)]
+pub struct SimulatedExchange {
+    config: GatewayConfig,
+    engine: MatchingEngine,
+    next_exchange_order_id: u64,
+    next_report_sequence: u128,
+    orders: HashMap<ClientOrderKey, OrderRecord>,
+    used_client_order_ids: HashSet<ClientOrderKey>,
+    live_orders: HashMap<u64, ClientOrderKey>,
+    request_cache: HashMap<(u64, u64), CachedRequest>,
+}
+
+impl Default for SimulatedExchange {
+    fn default() -> Self {
+        Self::new(GatewayConfig::default())
+    }
+}
+
+impl SimulatedExchange {
+    pub fn new(config: GatewayConfig) -> Self {
+        Self {
+            config,
+            engine: MatchingEngine::new(),
+            next_exchange_order_id: 0,
+            next_report_sequence: 0,
+            orders: HashMap::new(),
+            used_client_order_ids: HashSet::new(),
+            live_orders: HashMap::new(),
+            request_cache: HashMap::new(),
+        }
+    }
+
+    /// Apply one client request. Repeating an identical `(client_id, request_id)`
+    /// returns the original reports without touching the simulated exchange.
+    pub fn handle(&mut self, request: GatewayRequest) -> Result<GatewayResponse, GatewayError> {
+        if request.request_id == 0 {
+            return Err(GatewayError::InvalidRequestId);
+        }
+        let request_key = (request.client_id, request.request_id);
+        if let Some(cached) = self.request_cache.get(&request_key) {
+            if cached.command != request.command {
+                return Err(GatewayError::IdempotencyConflict);
+            }
+            return Ok(GatewayResponse {
+                client_id: request.client_id,
+                request_id: request.request_id,
+                replayed: true,
+                reports: cached.reports.clone(),
+            });
+        }
+
+        let reports = match request.command.clone() {
+            GatewayCommand::New {
+                client_order_id,
+                side,
+                price_ticks,
+                quantity_lots,
+            } => self.submit_new(
+                request.client_id,
+                request.request_id,
+                client_order_id,
+                side,
+                price_ticks,
+                quantity_lots,
+            )?,
+            GatewayCommand::Cancel { client_order_id } => {
+                self.cancel(request.client_id, request.request_id, client_order_id)
+            }
+            GatewayCommand::Replace {
+                client_order_id,
+                replacement_client_order_id,
+                price_ticks,
+                quantity_lots,
+            } => self.replace(
+                request.client_id,
+                request.request_id,
+                client_order_id,
+                replacement_client_order_id,
+                price_ticks,
+                quantity_lots,
+            )?,
+        };
+        self.request_cache.insert(
+            request_key,
+            CachedRequest {
+                command: request.command,
+                reports: reports.clone(),
+            },
+        );
+        Ok(GatewayResponse {
+            client_id: request.client_id,
+            request_id: request.request_id,
+            replayed: false,
+            reports,
+        })
+    }
+
+    pub fn best_bid(&self) -> Option<(i64, u128)> {
+        self.engine.best_bid()
+    }
+
+    pub fn best_ask(&self) -> Option<(i64, u128)> {
+        self.engine.best_ask()
+    }
+
+    pub fn live_order_count(&self) -> usize {
+        self.engine.live_order_count()
+    }
+
+    pub fn check_invariants(&self) -> Result<(), String> {
+        self.engine.check_invariants()?;
+        if self.live_orders.len() != self.engine.live_order_count() {
+            return Err("gateway and matching engine disagree on live order count".into());
+        }
+        for (exchange_id, key) in &self.live_orders {
+            let record = self
+                .orders
+                .get(key)
+                .ok_or_else(|| format!("live exchange order {exchange_id} has no client record"))?;
+            if record.exchange_order_id != *exchange_id
+                || !self.engine.contains_live_order(*exchange_id)
+                || matches!(
+                    record.status,
+                    OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+                )
+            {
+                return Err(format!(
+                    "live exchange order {exchange_id} has inconsistent status"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fingerprint exchange book state, client-visible order state, ID history,
+    /// and idempotency cache so replay comparisons include future behavior.
+    pub fn state_fingerprint(&self) -> u64 {
+        fn add(hash: &mut u64, bytes: &[u8]) {
+            for byte in bytes {
+                *hash = (*hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+        let mut hash = 0xcbf29ce484222325_u64;
+        add(&mut hash, &self.engine.state_fingerprint().to_le_bytes());
+        add(&mut hash, &self.next_exchange_order_id.to_le_bytes());
+        add(&mut hash, &self.next_report_sequence.to_le_bytes());
+        let mut order_keys: Vec<_> = self.orders.keys().copied().collect();
+        order_keys.sort_unstable();
+        for key in order_keys {
+            let record = self.orders[&key];
+            add(&mut hash, &key.client_id.to_le_bytes());
+            add(&mut hash, &key.client_order_id.to_le_bytes());
+            add(&mut hash, &record.exchange_order_id.to_le_bytes());
+            add(&mut hash, &record.last_request_id.to_le_bytes());
+            add(
+                &mut hash,
+                &[side_code(record.side), status_code(record.status)],
+            );
+            add(&mut hash, &record.price_ticks.to_le_bytes());
+            add(&mut hash, &record.order_quantity_lots.to_le_bytes());
+            add(&mut hash, &record.cumulative_quantity_lots.to_le_bytes());
+        }
+        let mut used_keys: Vec<_> = self.used_client_order_ids.iter().copied().collect();
+        used_keys.sort_unstable();
+        for key in used_keys {
+            add(&mut hash, &key.client_id.to_le_bytes());
+            add(&mut hash, &key.client_order_id.to_le_bytes());
+        }
+        let mut cached_keys: Vec<_> = self.request_cache.keys().copied().collect();
+        cached_keys.sort_unstable();
+        for key in cached_keys {
+            let cached = &self.request_cache[&key];
+            add(&mut hash, &key.0.to_le_bytes());
+            add(&mut hash, &key.1.to_le_bytes());
+            let command = serde_json::to_vec(&cached.command).expect("command serialization");
+            add(&mut hash, &command);
+            for report in &cached.reports {
+                let bytes = serde_json::to_vec(report).expect("report serialization");
+                add(&mut hash, &bytes);
+            }
+        }
+        hash
+    }
+
+    fn submit_new(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        client_order_id: u64,
+        side: Side,
+        price_ticks: i64,
+        quantity_lots: u64,
+    ) -> Result<Vec<ExecutionReport>, GatewayError> {
+        let key = ClientOrderKey {
+            client_id,
+            client_order_id,
+        };
+        if client_order_id == 0 {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                None,
+                Some(side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::InvalidClientOrderId,
+            )]);
+        }
+        if !self.used_client_order_ids.insert(key) {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                self.orders.get(&key).map(|record| record.exchange_order_id),
+                Some(side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::DuplicateClientOrderId,
+            )]);
+        }
+        if let Some(reason) = self.risk_rejection(price_ticks, quantity_lots) {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                None,
+                Some(side),
+                Some(price_ticks),
+                quantity_lots,
+                reason,
+            )]);
+        }
+        let exchange_order_id = self.allocate_exchange_order_id()?;
+        let result = self.engine.submit(OrderRequest {
+            order_id: exchange_order_id,
+            side,
+            price_ticks,
+            quantity_lots,
+        });
+        if let Some(reason) = result.rejection {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                None,
+                Some(side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::Engine(reason),
+            )]);
+        }
+        self.orders.insert(
+            key,
+            OrderRecord {
+                exchange_order_id,
+                last_request_id: request_id,
+                side,
+                price_ticks,
+                order_quantity_lots: quantity_lots,
+                cumulative_quantity_lots: 0,
+                status: OrderStatus::Accepted,
+            },
+        );
+        self.reports_for_submit(
+            client_id,
+            request_id,
+            key,
+            exchange_order_id,
+            side,
+            price_ticks,
+            quantity_lots,
+            result.trades,
+            result.resting_quantity_lots,
+            result.sequence,
+        )
+    }
+
+    fn cancel(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        client_order_id: u64,
+    ) -> Vec<ExecutionReport> {
+        let key = ClientOrderKey {
+            client_id,
+            client_order_id,
+        };
+        let Some(mut record) = self.orders.get(&key).copied() else {
+            return vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                None,
+                None,
+                None,
+                0,
+                GatewayRejectReason::UnknownClientOrderId,
+            )];
+        };
+        if !self.live_orders.contains_key(&record.exchange_order_id) {
+            return vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                Some(record.exchange_order_id),
+                Some(record.side),
+                Some(record.price_ticks),
+                record.order_quantity_lots,
+                GatewayRejectReason::OrderNotLive,
+            )];
+        }
+        let cancelled = self
+            .engine
+            .cancel(record.exchange_order_id)
+            .expect("gateway live index and engine book agree");
+        record.status = OrderStatus::Cancelled;
+        self.orders.insert(key, record);
+        self.live_orders.remove(&record.exchange_order_id);
+        vec![self.report(
+            client_id,
+            request_id,
+            client_order_id,
+            Some(record.exchange_order_id),
+            Some(cancelled.sequence),
+            OrderStatus::Cancelled,
+            Some(record.side),
+            Some(record.price_ticks),
+            record.order_quantity_lots,
+            record.cumulative_quantity_lots,
+            cancelled.remaining_lots,
+            0,
+            None,
+            None,
+        )]
+    }
+
+    fn replace(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        client_order_id: u64,
+        replacement_client_order_id: u64,
+        price_ticks: i64,
+        quantity_lots: u64,
+    ) -> Result<Vec<ExecutionReport>, GatewayError> {
+        let old_key = ClientOrderKey {
+            client_id,
+            client_order_id,
+        };
+        let new_key = ClientOrderKey {
+            client_id,
+            client_order_id: replacement_client_order_id,
+        };
+        if replacement_client_order_id == 0 {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                replacement_client_order_id,
+                None,
+                None,
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::InvalidClientOrderId,
+            )]);
+        }
+        if !self.used_client_order_ids.insert(new_key) {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                replacement_client_order_id,
+                self.orders
+                    .get(&new_key)
+                    .map(|record| record.exchange_order_id),
+                None,
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::DuplicateClientOrderId,
+            )]);
+        }
+        let Some(old_record) = self.orders.get(&old_key).copied() else {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                replacement_client_order_id,
+                None,
+                None,
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::UnknownClientOrderId,
+            )]);
+        };
+        if !self.live_orders.contains_key(&old_record.exchange_order_id) {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                replacement_client_order_id,
+                None,
+                None,
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::OrderNotLive,
+            )]);
+        }
+        if let Some(reason) = self.risk_rejection(price_ticks, quantity_lots) {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                replacement_client_order_id,
+                None,
+                Some(old_record.side),
+                Some(price_ticks),
+                quantity_lots,
+                reason,
+            )]);
+        }
+        let exchange_order_id = self.allocate_exchange_order_id()?;
+        let replaced = self.engine.replace(
+            old_record.exchange_order_id,
+            OrderRequest {
+                order_id: exchange_order_id,
+                side: old_record.side,
+                price_ticks,
+                quantity_lots,
+            },
+        );
+        if let Some(reason) = replaced.rejection {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                replacement_client_order_id,
+                None,
+                Some(old_record.side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::Engine(reason),
+            )]);
+        }
+
+        let mut reports = Vec::new();
+        let mut old_record = old_record;
+        old_record.status = OrderStatus::Cancelled;
+        self.orders.insert(old_key, old_record);
+        self.live_orders.remove(&old_record.exchange_order_id);
+        reports.push(self.report(
+            client_id,
+            request_id,
+            client_order_id,
+            Some(old_record.exchange_order_id),
+            replaced.cancelled_sequence,
+            OrderStatus::Cancelled,
+            Some(old_record.side),
+            Some(old_record.price_ticks),
+            old_record.order_quantity_lots,
+            old_record.cumulative_quantity_lots,
+            old_record.order_quantity_lots - old_record.cumulative_quantity_lots,
+            0,
+            None,
+            None,
+        ));
+
+        self.orders.insert(
+            new_key,
+            OrderRecord {
+                exchange_order_id,
+                last_request_id: request_id,
+                side: old_record.side,
+                price_ticks,
+                order_quantity_lots: quantity_lots,
+                cumulative_quantity_lots: 0,
+                status: OrderStatus::Accepted,
+            },
+        );
+        reports.extend(self.reports_for_submit(
+            client_id,
+            request_id,
+            new_key,
+            exchange_order_id,
+            old_record.side,
+            price_ticks,
+            quantity_lots,
+            replaced.replacement.trades,
+            replaced.replacement.resting_quantity_lots,
+            replaced.replacement.sequence,
+        )?);
+        Ok(reports)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reports_for_submit(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        taker_key: ClientOrderKey,
+        taker_exchange_id: u64,
+        taker_side: Side,
+        taker_price: i64,
+        taker_quantity: u64,
+        trades: Vec<Trade>,
+        resting_quantity: u64,
+        engine_sequence: Option<u64>,
+    ) -> Result<Vec<ExecutionReport>, GatewayError> {
+        let mut reports = Vec::with_capacity(trades.len().saturating_mul(2).max(1));
+        let had_trades = !trades.is_empty();
+        for trade in trades {
+            let maker_key = *self
+                .live_orders
+                .get(&trade.maker_order_id)
+                .expect("matching engine maker is represented by gateway state");
+            let mut maker = self.orders[&maker_key];
+            maker.cumulative_quantity_lots = maker
+                .cumulative_quantity_lots
+                .checked_add(trade.quantity_lots)
+                .expect("cumulative fills cannot exceed submitted quantity");
+            let maker_leaves = maker.order_quantity_lots - maker.cumulative_quantity_lots;
+            maker.status = if maker_leaves == 0 {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::PartiallyFilled
+            };
+            self.orders.insert(maker_key, maker);
+            if maker_leaves == 0 {
+                self.live_orders.remove(&trade.maker_order_id);
+            }
+            reports.push(self.report(
+                maker_key.client_id,
+                maker.last_request_id,
+                maker_key.client_order_id,
+                Some(trade.maker_order_id),
+                Some(trade.sequence),
+                maker.status,
+                Some(maker.side),
+                Some(maker.price_ticks),
+                maker.order_quantity_lots,
+                maker.cumulative_quantity_lots,
+                maker_leaves,
+                trade.quantity_lots,
+                Some(trade.price_ticks),
+                None,
+            ));
+
+            let mut taker = self.orders[&taker_key];
+            taker.cumulative_quantity_lots = taker
+                .cumulative_quantity_lots
+                .checked_add(trade.quantity_lots)
+                .expect("cumulative fills cannot exceed submitted quantity");
+            let taker_leaves = taker.order_quantity_lots - taker.cumulative_quantity_lots;
+            taker.status = if taker_leaves == 0 {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::PartiallyFilled
+            };
+            self.orders.insert(taker_key, taker);
+            reports.push(self.report(
+                client_id,
+                request_id,
+                taker_key.client_order_id,
+                Some(taker_exchange_id),
+                Some(trade.sequence),
+                taker.status,
+                Some(taker_side),
+                Some(taker_price),
+                taker_quantity,
+                taker.cumulative_quantity_lots,
+                taker_leaves,
+                trade.quantity_lots,
+                Some(trade.price_ticks),
+                None,
+            ));
+        }
+        if !had_trades {
+            reports.push(self.report(
+                client_id,
+                request_id,
+                taker_key.client_order_id,
+                Some(taker_exchange_id),
+                engine_sequence,
+                OrderStatus::Accepted,
+                Some(taker_side),
+                Some(taker_price),
+                taker_quantity,
+                0,
+                resting_quantity,
+                0,
+                None,
+                None,
+            ));
+        }
+        if resting_quantity > 0 {
+            self.live_orders.insert(taker_exchange_id, taker_key);
+        }
+        Ok(reports)
+    }
+
+    fn risk_rejection(&self, price_ticks: i64, quantity_lots: u64) -> Option<GatewayRejectReason> {
+        if price_ticks <= 0 || quantity_lots == 0 {
+            return Some(GatewayRejectReason::Engine(if price_ticks <= 0 {
+                RejectReason::InvalidPrice
+            } else {
+                RejectReason::InvalidQuantity
+            }));
+        }
+        if quantity_lots > self.config.max_order_quantity_lots {
+            return Some(GatewayRejectReason::QuantityLimit);
+        }
+        let notional = (price_ticks as u128).checked_mul(u128::from(quantity_lots));
+        if notional.is_none_or(|value| value > self.config.max_order_notional_ticks_lots) {
+            return Some(GatewayRejectReason::NotionalLimit);
+        }
+        None
+    }
+
+    fn allocate_exchange_order_id(&mut self) -> Result<u64, GatewayError> {
+        self.next_exchange_order_id = self
+            .next_exchange_order_id
+            .checked_add(1)
+            .ok_or(GatewayError::ExchangeOrderIdExhausted)?;
+        Ok(self.next_exchange_order_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reject(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        client_order_id: u64,
+        exchange_order_id: Option<u64>,
+        side: Option<Side>,
+        price_ticks: Option<i64>,
+        quantity_lots: u64,
+        reason: GatewayRejectReason,
+    ) -> ExecutionReport {
+        self.report(
+            client_id,
+            request_id,
+            client_order_id,
+            exchange_order_id,
+            None,
+            OrderStatus::Rejected,
+            side,
+            price_ticks,
+            quantity_lots,
+            0,
+            0,
+            0,
+            None,
+            Some(reason),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn report(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        client_order_id: u64,
+        exchange_order_id: Option<u64>,
+        engine_sequence: Option<u64>,
+        status: OrderStatus,
+        side: Option<Side>,
+        price_ticks: Option<i64>,
+        order_quantity_lots: u64,
+        cumulative_quantity_lots: u64,
+        leaves_quantity_lots: u64,
+        last_quantity_lots: u64,
+        last_price_ticks: Option<i64>,
+        reject_reason: Option<GatewayRejectReason>,
+    ) -> ExecutionReport {
+        self.next_report_sequence = self
+            .next_report_sequence
+            .checked_add(1)
+            .expect("u128 execution report sequence exhausted");
+        ExecutionReport {
+            report_sequence: self.next_report_sequence,
+            client_id,
+            request_id,
+            client_order_id,
+            exchange_order_id,
+            engine_sequence,
+            status,
+            side,
+            price_ticks,
+            order_quantity_lots,
+            cumulative_quantity_lots,
+            leaves_quantity_lots,
+            last_quantity_lots,
+            last_price_ticks,
+            reject_reason,
+        }
+    }
+}
+
+fn side_code(side: Side) -> u8 {
+    match side {
+        Side::Buy => 0,
+        Side::Sell => 1,
+    }
+}
+
+fn status_code(status: OrderStatus) -> u8 {
+    match status {
+        OrderStatus::Accepted => 0,
+        OrderStatus::PartiallyFilled => 1,
+        OrderStatus::Filled => 2,
+        OrderStatus::Cancelled => 3,
+        OrderStatus::Rejected => 4,
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct JsonlSummary {
+    pub requests: u64,
+    pub replayed_requests: u64,
+    pub reports: u64,
+    pub rejections: u64,
+    pub state_fingerprint: u64,
+}
+
+/// Read JSONL client requests and write one JSONL response per request.
+pub fn run_jsonl<R: BufRead, W: Write>(
+    reader: R,
+    mut writer: W,
+    config: GatewayConfig,
+) -> Result<JsonlSummary, String> {
+    let mut exchange = SimulatedExchange::new(config);
+    let mut summary = JsonlSummary::default();
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| format!("line {}: {error}", line_index + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: GatewayRequest = serde_json::from_str(&line)
+            .map_err(|error| format!("line {}: {error}", line_index + 1))?;
+        let response = exchange
+            .handle(request)
+            .map_err(|error| format!("line {}: {error}", line_index + 1))?;
+        summary.requests += 1;
+        summary.replayed_requests += u64::from(response.replayed);
+        summary.reports += response.reports.len() as u64;
+        summary.rejections += response
+            .reports
+            .iter()
+            .filter(|report| report.status == OrderStatus::Rejected)
+            .count() as u64;
+        serde_json::to_writer(&mut writer, &response).map_err(|error| error.to_string())?;
+        writer.write_all(b"\n").map_err(|error| error.to_string())?;
+    }
+    writer.flush().map_err(|error| error.to_string())?;
+    summary.state_fingerprint = exchange.state_fingerprint();
+    exchange
+        .check_invariants()
+        .map_err(|error| format!("exchange invariant failed: {error}"))?;
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(client_id: u64, request_id: u64, command: GatewayCommand) -> GatewayRequest {
+        GatewayRequest {
+            client_id,
+            request_id,
+            command,
+        }
+    }
+
+    fn new_order(id: u64, side: Side, price: i64, quantity: u64) -> GatewayCommand {
+        GatewayCommand::New {
+            client_order_id: id,
+            side,
+            price_ticks: price,
+            quantity_lots: quantity,
+        }
+    }
+
+    #[test]
+    fn partial_fills_then_cancel_reconcile_cumulative_and_leaves() {
+        let mut exchange = SimulatedExchange::default();
+        let ask = exchange
+            .handle(request(1, 1, new_order(11, Side::Sell, 100, 5)))
+            .unwrap();
+        assert_eq!(ask.reports[0].status, OrderStatus::Accepted);
+        let buy = exchange
+            .handle(request(2, 1, new_order(21, Side::Buy, 100, 3)))
+            .unwrap();
+        assert_eq!(buy.reports.len(), 2);
+        assert_eq!(buy.reports[0].client_order_id, 11);
+        assert_eq!(buy.reports[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(buy.reports[0].cumulative_quantity_lots, 3);
+        assert_eq!(buy.reports[0].leaves_quantity_lots, 2);
+        assert_eq!(buy.reports[1].client_order_id, 21);
+        assert_eq!(buy.reports[1].status, OrderStatus::Filled);
+        assert_eq!(buy.reports[1].last_price_ticks, Some(100));
+        let cancel = exchange
+            .handle(request(
+                1,
+                2,
+                GatewayCommand::Cancel {
+                    client_order_id: 11,
+                },
+            ))
+            .unwrap();
+        assert_eq!(cancel.reports[0].status, OrderStatus::Cancelled);
+        assert_eq!(cancel.reports[0].cumulative_quantity_lots, 3);
+        assert_eq!(cancel.reports[0].leaves_quantity_lots, 2);
+        assert_eq!(exchange.live_order_count(), 0);
+        assert!(exchange.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn request_retry_is_idempotent_and_conflicting_retry_is_rejected() {
+        let mut exchange = SimulatedExchange::default();
+        let command = new_order(1, Side::Buy, 99, 2);
+        let first = exchange.handle(request(3, 7, command.clone())).unwrap();
+        let retry = exchange.handle(request(3, 7, command)).unwrap();
+        assert!(!first.replayed);
+        assert!(retry.replayed);
+        assert_eq!(first.reports, retry.reports);
+        assert_eq!(exchange.live_order_count(), 1);
+        assert_eq!(
+            exchange.handle(request(3, 7, new_order(2, Side::Buy, 99, 2))),
+            Err(GatewayError::IdempotencyConflict)
+        );
+        assert_eq!(exchange.live_order_count(), 1);
+    }
+
+    #[test]
+    fn replacement_cancels_old_order_and_loses_fifo_priority() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 100, 2)))
+            .unwrap();
+        exchange
+            .handle(request(2, 1, new_order(1, Side::Buy, 100, 2)))
+            .unwrap();
+        let replaced = exchange
+            .handle(request(
+                1,
+                2,
+                GatewayCommand::Replace {
+                    client_order_id: 1,
+                    replacement_client_order_id: 2,
+                    price_ticks: 100,
+                    quantity_lots: 2,
+                },
+            ))
+            .unwrap();
+        assert_eq!(replaced.reports[0].status, OrderStatus::Cancelled);
+        assert_eq!(replaced.reports[1].status, OrderStatus::Accepted);
+        let sell = exchange
+            .handle(request(3, 1, new_order(2, Side::Sell, 100, 4)))
+            .unwrap();
+        assert_eq!(sell.reports[0].client_order_id, 1);
+        assert_eq!(sell.reports[0].client_id, 2);
+        assert_eq!(sell.reports[0].status, OrderStatus::Filled);
+        assert_eq!(sell.reports[1].client_order_id, 2);
+        assert_eq!(sell.reports[1].client_id, 3);
+        assert_eq!(sell.reports[2].client_order_id, 2);
+        assert_eq!(sell.reports[2].client_id, 1);
+        assert_eq!(sell.reports[2].status, OrderStatus::Filled);
+        assert_eq!(sell.reports[3].client_id, 3);
+        assert_eq!(sell.reports[3].client_order_id, 2);
+        assert_eq!(sell.reports[1].status, OrderStatus::PartiallyFilled);
+        assert!(exchange.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn risk_rejection_does_not_change_the_exchange_book() {
+        let config = GatewayConfig {
+            max_order_quantity_lots: 5,
+            max_order_notional_ticks_lots: 500,
+        };
+        let mut exchange = SimulatedExchange::new(config);
+        let before = exchange.state_fingerprint();
+        let rejected = exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 101, 5)))
+            .unwrap();
+        assert_eq!(rejected.reports[0].status, OrderStatus::Rejected);
+        assert_eq!(
+            rejected.reports[0].reject_reason,
+            Some(GatewayRejectReason::NotionalLimit)
+        );
+        assert_eq!(exchange.live_order_count(), 0);
+        // The request cache and report sequence advance, but the matching book does not.
+        assert_ne!(exchange.state_fingerprint(), before);
+        assert!(exchange.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn deterministic_jsonl_replay_matches_byte_for_byte() {
+        let input = concat!(
+            "{\"client_id\":1,\"request_id\":1,\"command\":{\"type\":\"new\",\"client_order_id\":1,\"side\":\"sell\",\"price_ticks\":100,\"quantity_lots\":2}}\n",
+            "{\"client_id\":2,\"request_id\":1,\"command\":{\"type\":\"new\",\"client_order_id\":1,\"side\":\"buy\",\"price_ticks\":100,\"quantity_lots\":1}}\n",
+            "{\"client_id\":1,\"request_id\":2,\"command\":{\"type\":\"cancel\",\"client_order_id\":1}}\n"
+        );
+        let mut first = Vec::new();
+        let one = run_jsonl(input.as_bytes(), &mut first, GatewayConfig::default()).unwrap();
+        let mut second = Vec::new();
+        let two = run_jsonl(input.as_bytes(), &mut second, GatewayConfig::default()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(one, two);
+        assert_eq!(one.requests, 3);
+        assert_eq!(one.reports, 4);
+        assert_eq!(one.rejections, 0);
+    }
+}
