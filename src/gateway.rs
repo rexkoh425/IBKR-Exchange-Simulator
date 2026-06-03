@@ -279,6 +279,24 @@ impl SimulatedExchange {
                 ));
             }
         }
+        for (key, record) in &self.orders {
+            let is_live = matches!(
+                record.status,
+                OrderStatus::Accepted | OrderStatus::PartiallyFilled
+            );
+            if !self.used_client_order_ids.contains(key) {
+                return Err(format!(
+                    "client order {}:{} is absent from ID history",
+                    key.client_id, key.client_order_id
+                ));
+            }
+            if is_live != self.live_orders.contains_key(&record.exchange_order_id) {
+                return Err(format!(
+                    "client order {}:{} has inconsistent live status",
+                    key.client_id, key.client_order_id
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1035,6 +1053,112 @@ mod tests {
         // The request cache and report sequence advance, but the matching book does not.
         assert_ne!(exchange.state_fingerprint(), before);
         assert!(exchange.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn risk_rejected_replace_keeps_the_original_order_live() {
+        let config = GatewayConfig {
+            max_order_quantity_lots: 5,
+            max_order_notional_ticks_lots: 500,
+        };
+        let mut exchange = SimulatedExchange::new(config);
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 90, 2)))
+            .unwrap();
+        let before = exchange.best_bid();
+        let response = exchange
+            .handle(request(
+                1,
+                2,
+                GatewayCommand::Replace {
+                    client_order_id: 1,
+                    replacement_client_order_id: 2,
+                    price_ticks: 101,
+                    quantity_lots: 5,
+                },
+            ))
+            .unwrap();
+        assert_eq!(response.reports[0].status, OrderStatus::Rejected);
+        assert_eq!(
+            response.reports[0].reject_reason,
+            Some(GatewayRejectReason::NotionalLimit)
+        );
+        assert_eq!(exchange.best_bid(), before);
+        assert_eq!(exchange.live_order_count(), 1);
+        assert!(exchange.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn mixed_client_order_flow_keeps_book_and_reports_consistent() {
+        let mut exchange = SimulatedExchange::default();
+        let mut random = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut last_report_sequence = 0_u128;
+        let mut known_orders = Vec::new();
+        for index in 1..=2_000_u64 {
+            random ^= random << 7;
+            random ^= random >> 9;
+            random ^= random << 8;
+            let client_id = random % 4;
+            let request_id = index;
+            let command = match random % 4 {
+                0 | 1 => {
+                    let client_order_id = index;
+                    known_orders.push((client_id, client_order_id));
+                    new_order(
+                        client_order_id,
+                        if random & 4 == 0 {
+                            Side::Buy
+                        } else {
+                            Side::Sell
+                        },
+                        98 + ((random >> 4) % 5) as i64,
+                        1 + ((random >> 9) % 8),
+                    )
+                }
+                2 if !known_orders.is_empty() => {
+                    let (target_client, client_order_id) =
+                        known_orders[(random as usize >> 8) % known_orders.len()];
+                    GatewayCommand::Cancel {
+                        client_order_id: if target_client == client_id {
+                            client_order_id
+                        } else {
+                            u64::MAX - client_order_id
+                        },
+                    }
+                }
+                3 if !known_orders.is_empty() => {
+                    let (target_client, client_order_id) =
+                        known_orders[(random as usize >> 8) % known_orders.len()];
+                    GatewayCommand::Replace {
+                        client_order_id: if target_client == client_id {
+                            client_order_id
+                        } else {
+                            u64::MAX - client_order_id
+                        },
+                        replacement_client_order_id: index,
+                        price_ticks: 98 + ((random >> 4) % 5) as i64,
+                        quantity_lots: 1 + ((random >> 9) % 8),
+                    }
+                }
+                _ => new_order(index, Side::Buy, 100, 1),
+            };
+            let response = exchange
+                .handle(request(client_id, request_id, command))
+                .unwrap();
+            for report in response.reports {
+                assert!(report.report_sequence > last_report_sequence);
+                last_report_sequence = report.report_sequence;
+                if report.status != OrderStatus::Rejected {
+                    assert_eq!(
+                        report.cumulative_quantity_lots + report.leaves_quantity_lots,
+                        report.order_quantity_lots
+                    );
+                }
+            }
+            exchange
+                .check_invariants()
+                .expect("gateway and matching engine state must remain consistent");
+        }
     }
 
     #[test]
