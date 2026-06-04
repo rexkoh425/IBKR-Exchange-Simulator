@@ -1,0 +1,5 @@
+{"client_id":1,"request_id":1,"command":{"type":"new","client_order_id":101,"side":"sell","price_ticks":100,"quantity_lots":5}}
+{"client_id":2,"request_id":1,"command":{"type":"new","client_order_id":201,"side":"buy","price_ticks":100,"quantity_lots":3}}
+{"client_id":1,"request_id":2,"command":{"type":"replace","client_order_id":101,"replacement_client_order_id":102,"price_ticks":99,"quantity_lots":2}}
+{"client_id":3,"request_id":1,"command":{"type":"new","client_order_id":301,"side":"buy","price_ticks":99,"quantity_lots":2}}
+{"client_id":3,"request_id":1,"command":{"type":"new","client_order_id":301,"side":"buy","price_ticks":99,"quantity_lots":2}}

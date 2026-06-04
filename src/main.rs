@@ -1,10 +1,58 @@
 use equity_matching_engine::{
-    benchmark, ibkr, market_benchmark, pipeline, replay, MatchingEngine, OrderRequest, Side,
+    benchmark, gateway, ibkr, market_benchmark, pipeline, replay, MatchingEngine, OrderRequest,
+    Side,
 };
 use std::fs::File;
 use std::io::{stdin, stdout, BufReader};
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("exchange-sim") {
+        let mut input = None;
+        let mut max_order_quantity_lots = u64::MAX;
+        let mut max_order_notional_ticks_lots = u128::MAX;
+        let mut args = std::env::args().skip(2);
+        while let Some(flag) = args.next() {
+            let value = args.next().unwrap_or_else(|| usage());
+            match flag.as_str() {
+                "--input" => input = Some(value),
+                "--max-order-quantity" => {
+                    max_order_quantity_lots = value.parse().unwrap_or_else(|_| usage())
+                }
+                "--max-order-notional" => {
+                    max_order_notional_ticks_lots = value.parse().unwrap_or_else(|_| usage())
+                }
+                _ => usage(),
+            }
+        }
+        let reader: Box<dyn std::io::BufRead> = match input {
+            Some(path) => Box::new(BufReader::new(File::open(&path).unwrap_or_else(|error| {
+                eprintln!("cannot open {path}: {error}");
+                std::process::exit(1);
+            }))),
+            None => Box::new(stdin().lock()),
+        };
+        let summary = gateway::run_jsonl(
+            reader,
+            stdout().lock(),
+            gateway::GatewayConfig {
+                max_order_quantity_lots,
+                max_order_notional_ticks_lots,
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("exchange simulation failed: {error}");
+            std::process::exit(1);
+        });
+        eprintln!(
+            "requests={},replayed_requests={},reports={},rejections={},state_fingerprint={:016x}",
+            summary.requests,
+            summary.replayed_requests,
+            summary.reports,
+            summary.rejections,
+            summary.state_fingerprint
+        );
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("ibkr-capture") {
         match ibkr::Config::from_env().and_then(ibkr::capture) {
             Ok(()) => return,
@@ -458,7 +506,7 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|market-data-benchmark|market-data-spsc-benchmark|ibkr-capture|market-replay [options]");
+    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|market-data-benchmark|market-data-spsc-benchmark|ibkr-capture|market-replay|exchange-sim [options]");
     std::process::exit(2);
 }
 

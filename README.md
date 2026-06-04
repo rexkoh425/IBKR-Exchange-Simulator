@@ -79,6 +79,31 @@ data throughput; use `market-data-benchmark` for isolated normalization,
 JSONL persistence, decoding and replay stages.
 It does not establish those metrics for the IBKR capture or persistence path.
 
+## Simulated exchange order gateway
+
+`cargo run --release -- exchange-sim --input fixtures/exchange-session.jsonl`
+replays client order requests as newline-delimited JSON and writes execution
+reports as JSONL. Input can also come from standard input. Each request includes
+`client_id`, a client-scoped idempotent `request_id`, and a tagged `command`:
+`new`, `cancel`, or `replace`. The gateway emits monotone report sequence
+numbers, exchange order IDs, engine sequence numbers, fill prices/quantities,
+cumulative fills, leaves, and explicit reject reasons. A repeated identical
+request replays its original reports; reusing a request ID for a different
+command is a protocol error.
+
+The simulator enforces optional quantity and price-times-quantity notional
+limits with `--max-order-quantity` and `--max-order-notional`. Replace uses a
+new client order ID, cancels the old order, and sends the replacement to the
+back of its new price level; rejected replacements leave the old order live.
+All clients share the same deterministic matching book, and client IDs scope
+client order IDs. This is an in-process JSONL simulator, not a network FIX
+gateway, and does not model exchange latency, auctions, fees, or venue-specific
+order types.
+
+The example fixture exercises acknowledgement, partial fill, cancel/replace,
+full fill, and an idempotent retry. The gateway checks book/index consistency
+after replay and returns a state fingerprint for repeat-run comparisons.
+
 ## Event log and replay
 
 `eventlog` provides schema-versioned JSONL records for synthetic submit/cancel
