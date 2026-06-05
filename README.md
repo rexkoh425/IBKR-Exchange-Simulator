@@ -102,7 +102,9 @@ order types.
 
 The example fixture exercises acknowledgement, partial fill, cancel/replace,
 full fill, and an idempotent retry. The gateway checks book/index consistency
-after replay and returns a state fingerprint for repeat-run comparisons.
+after replay and returns a state fingerprint for repeat-run comparisons. See the
+[gateway verification report](benchmarks/exchange-gateway-verification-2026-11-10.md)
+for correctness evidence, reproduction and matcher benchmark limits.
 
 ## Event log and replay
 
