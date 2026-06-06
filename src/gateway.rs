@@ -9,6 +9,25 @@ use crate::{MatchingEngine, OrderRequest, RejectReason, Side, Trade};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex};
+
+fn default_symbol() -> String {
+    "DEFAULT".to_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderStateSnapshot {
+    pub client_id: u64,
+    pub client_order_id: u64,
+    pub exchange_order_id: u64,
+    pub symbol: String,
+    pub side: Side,
+    pub price_ticks: i64,
+    pub order_quantity_lots: u64,
+    pub cumulative_quantity_lots: u64,
+    pub leaves_quantity_lots: u64,
+    pub status: OrderStatus,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatewayConfig {
@@ -37,6 +56,8 @@ pub struct GatewayRequest {
 pub enum GatewayCommand {
     New {
         client_order_id: u64,
+        #[serde(default = "default_symbol")]
+        symbol: String,
         side: Side,
         price_ticks: i64,
         quantity_lots: u64,
@@ -65,6 +86,7 @@ pub enum OrderStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "detail", rename_all = "snake_case")]
 pub enum GatewayRejectReason {
+    InvalidSymbol,
     InvalidClientOrderId,
     DuplicateClientOrderId,
     UnknownClientOrderId,
@@ -80,6 +102,7 @@ pub struct ExecutionReport {
     pub client_id: u64,
     pub request_id: u64,
     pub client_order_id: u64,
+    pub symbol: Option<String>,
     pub exchange_order_id: Option<u64>,
     pub engine_sequence: Option<u64>,
     pub status: OrderStatus,
@@ -107,6 +130,7 @@ pub enum GatewayError {
     InvalidRequestId,
     IdempotencyConflict,
     ExchangeOrderIdExhausted,
+    LockPoisoned,
 }
 
 impl std::fmt::Display for GatewayError {
@@ -119,6 +143,7 @@ impl std::fmt::Display for GatewayError {
             Self::ExchangeOrderIdExhausted => {
                 formatter.write_str("simulated exchange order ID space is exhausted")
             }
+            Self::LockPoisoned => formatter.write_str("simulated exchange state lock is poisoned"),
         }
     }
 }
@@ -131,10 +156,11 @@ struct ClientOrderKey {
     client_order_id: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct OrderRecord {
     exchange_order_id: u64,
     last_request_id: u64,
+    symbol: String,
     side: Side,
     price_ticks: i64,
     order_quantity_lots: u64,
@@ -151,7 +177,7 @@ struct CachedRequest {
 #[derive(Debug)]
 pub struct SimulatedExchange {
     config: GatewayConfig,
-    engine: MatchingEngine,
+    engines: HashMap<String, MatchingEngine>,
     next_exchange_order_id: u64,
     next_report_sequence: u128,
     orders: HashMap<ClientOrderKey, OrderRecord>,
@@ -170,7 +196,7 @@ impl SimulatedExchange {
     pub fn new(config: GatewayConfig) -> Self {
         Self {
             config,
-            engine: MatchingEngine::new(),
+            engines: HashMap::new(),
             next_exchange_order_id: 0,
             next_report_sequence: 0,
             orders: HashMap::new(),
@@ -202,6 +228,7 @@ impl SimulatedExchange {
         let reports = match request.command.clone() {
             GatewayCommand::New {
                 client_order_id,
+                symbol,
                 side,
                 price_ticks,
                 quantity_lots,
@@ -209,6 +236,7 @@ impl SimulatedExchange {
                 request.client_id,
                 request.request_id,
                 client_order_id,
+                symbol,
                 side,
                 price_ticks,
                 quantity_lots,
@@ -246,20 +274,56 @@ impl SimulatedExchange {
     }
 
     pub fn best_bid(&self) -> Option<(i64, u128)> {
-        self.engine.best_bid()
+        self.best_bid_for("DEFAULT")
     }
 
     pub fn best_ask(&self) -> Option<(i64, u128)> {
-        self.engine.best_ask()
+        self.best_ask_for("DEFAULT")
+    }
+
+    pub fn best_bid_for(&self, symbol: &str) -> Option<(i64, u128)> {
+        self.engines.get(symbol).and_then(MatchingEngine::best_bid)
+    }
+
+    pub fn best_ask_for(&self, symbol: &str) -> Option<(i64, u128)> {
+        self.engines.get(symbol).and_then(MatchingEngine::best_ask)
     }
 
     pub fn live_order_count(&self) -> usize {
-        self.engine.live_order_count()
+        self.engines
+            .values()
+            .map(MatchingEngine::live_order_count)
+            .sum()
+    }
+
+    pub fn order_states(&self) -> Vec<OrderStateSnapshot> {
+        let mut states: Vec<_> = self
+            .orders
+            .iter()
+            .map(|(key, record)| OrderStateSnapshot {
+                client_id: key.client_id,
+                client_order_id: key.client_order_id,
+                exchange_order_id: record.exchange_order_id,
+                symbol: record.symbol.clone(),
+                side: record.side,
+                price_ticks: record.price_ticks,
+                order_quantity_lots: record.order_quantity_lots,
+                cumulative_quantity_lots: record.cumulative_quantity_lots,
+                leaves_quantity_lots: record.order_quantity_lots - record.cumulative_quantity_lots,
+                status: record.status,
+            })
+            .collect();
+        states.sort_by_key(|state| (state.client_id, state.client_order_id));
+        states
     }
 
     pub fn check_invariants(&self) -> Result<(), String> {
-        self.engine.check_invariants()?;
-        if self.live_orders.len() != self.engine.live_order_count() {
+        for (symbol, engine) in &self.engines {
+            engine
+                .check_invariants()
+                .map_err(|error| format!("symbol {symbol}: {error}"))?;
+        }
+        if self.live_orders.len() != self.live_order_count() {
             return Err("gateway and matching engine disagree on live order count".into());
         }
         for (exchange_id, key) in &self.live_orders {
@@ -268,7 +332,10 @@ impl SimulatedExchange {
                 .get(key)
                 .ok_or_else(|| format!("live exchange order {exchange_id} has no client record"))?;
             if record.exchange_order_id != *exchange_id
-                || !self.engine.contains_live_order(*exchange_id)
+                || !self
+                    .engines
+                    .get(&record.symbol)
+                    .is_some_and(|engine| engine.contains_live_order(*exchange_id))
                 || matches!(
                     record.status,
                     OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
@@ -309,17 +376,26 @@ impl SimulatedExchange {
             }
         }
         let mut hash = 0xcbf29ce484222325_u64;
-        add(&mut hash, &self.engine.state_fingerprint().to_le_bytes());
+        let mut symbols: Vec<_> = self.engines.keys().collect();
+        symbols.sort_unstable();
+        for symbol in symbols {
+            add(&mut hash, symbol.as_bytes());
+            add(
+                &mut hash,
+                &self.engines[symbol].state_fingerprint().to_le_bytes(),
+            );
+        }
         add(&mut hash, &self.next_exchange_order_id.to_le_bytes());
         add(&mut hash, &self.next_report_sequence.to_le_bytes());
         let mut order_keys: Vec<_> = self.orders.keys().copied().collect();
         order_keys.sort_unstable();
         for key in order_keys {
-            let record = self.orders[&key];
+            let record = &self.orders[&key];
             add(&mut hash, &key.client_id.to_le_bytes());
             add(&mut hash, &key.client_order_id.to_le_bytes());
             add(&mut hash, &record.exchange_order_id.to_le_bytes());
             add(&mut hash, &record.last_request_id.to_le_bytes());
+            add(&mut hash, record.symbol.as_bytes());
             add(
                 &mut hash,
                 &[side_code(record.side), status_code(record.status)],
@@ -355,6 +431,7 @@ impl SimulatedExchange {
         client_id: u64,
         request_id: u64,
         client_order_id: u64,
+        symbol: String,
         side: Side,
         price_ticks: i64,
         quantity_lots: u64,
@@ -387,6 +464,18 @@ impl SimulatedExchange {
                 GatewayRejectReason::DuplicateClientOrderId,
             )]);
         }
+        if symbol.trim().is_empty() {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                None,
+                Some(side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::InvalidSymbol,
+            )]);
+        }
         if let Some(reason) = self.risk_rejection(price_ticks, quantity_lots) {
             return Ok(vec![self.reject(
                 client_id,
@@ -400,12 +489,16 @@ impl SimulatedExchange {
             )]);
         }
         let exchange_order_id = self.allocate_exchange_order_id()?;
-        let result = self.engine.submit(OrderRequest {
-            order_id: exchange_order_id,
-            side,
-            price_ticks,
-            quantity_lots,
-        });
+        let result = self
+            .engines
+            .entry(symbol.clone())
+            .or_default()
+            .submit(OrderRequest {
+                order_id: exchange_order_id,
+                side,
+                price_ticks,
+                quantity_lots,
+            });
         if let Some(reason) = result.rejection {
             return Ok(vec![self.reject(
                 client_id,
@@ -423,6 +516,7 @@ impl SimulatedExchange {
             OrderRecord {
                 exchange_order_id,
                 last_request_id: request_id,
+                symbol,
                 side,
                 price_ticks,
                 order_quantity_lots: quantity_lots,
@@ -454,7 +548,7 @@ impl SimulatedExchange {
             client_id,
             client_order_id,
         };
-        let Some(mut record) = self.orders.get(&key).copied() else {
+        let Some(mut record) = self.orders.get(&key).cloned() else {
             return vec![self.reject(
                 client_id,
                 request_id,
@@ -479,11 +573,13 @@ impl SimulatedExchange {
             )];
         }
         let cancelled = self
-            .engine
+            .engines
+            .get_mut(&record.symbol)
+            .expect("order symbol has a matching engine")
             .cancel(record.exchange_order_id)
             .expect("gateway live index and engine book agree");
         record.status = OrderStatus::Cancelled;
-        self.orders.insert(key, record);
+        self.orders.insert(key, record.clone());
         self.live_orders.remove(&record.exchange_order_id);
         vec![self.report(
             client_id,
@@ -546,7 +642,7 @@ impl SimulatedExchange {
                 GatewayRejectReason::DuplicateClientOrderId,
             )]);
         }
-        let Some(old_record) = self.orders.get(&old_key).copied() else {
+        let Some(old_record) = self.orders.get(&old_key).cloned() else {
             return Ok(vec![self.reject(
                 client_id,
                 request_id,
@@ -583,15 +679,19 @@ impl SimulatedExchange {
             )]);
         }
         let exchange_order_id = self.allocate_exchange_order_id()?;
-        let replaced = self.engine.replace(
-            old_record.exchange_order_id,
-            OrderRequest {
-                order_id: exchange_order_id,
-                side: old_record.side,
-                price_ticks,
-                quantity_lots,
-            },
-        );
+        let replaced = self
+            .engines
+            .get_mut(&old_record.symbol)
+            .expect("order symbol has a matching engine")
+            .replace(
+                old_record.exchange_order_id,
+                OrderRequest {
+                    order_id: exchange_order_id,
+                    side: old_record.side,
+                    price_ticks,
+                    quantity_lots,
+                },
+            );
         if let Some(reason) = replaced.rejection {
             return Ok(vec![self.reject(
                 client_id,
@@ -608,7 +708,7 @@ impl SimulatedExchange {
         let mut reports = Vec::new();
         let mut old_record = old_record;
         old_record.status = OrderStatus::Cancelled;
-        self.orders.insert(old_key, old_record);
+        self.orders.insert(old_key, old_record.clone());
         self.live_orders.remove(&old_record.exchange_order_id);
         reports.push(self.report(
             client_id,
@@ -632,6 +732,7 @@ impl SimulatedExchange {
             OrderRecord {
                 exchange_order_id,
                 last_request_id: request_id,
+                symbol: old_record.symbol.clone(),
                 side: old_record.side,
                 price_ticks,
                 order_quantity_lots: quantity_lots,
@@ -675,7 +776,7 @@ impl SimulatedExchange {
                 .live_orders
                 .get(&trade.maker_order_id)
                 .expect("matching engine maker is represented by gateway state");
-            let mut maker = self.orders[&maker_key];
+            let mut maker = self.orders[&maker_key].clone();
             maker.cumulative_quantity_lots = maker
                 .cumulative_quantity_lots
                 .checked_add(trade.quantity_lots)
@@ -686,7 +787,7 @@ impl SimulatedExchange {
             } else {
                 OrderStatus::PartiallyFilled
             };
-            self.orders.insert(maker_key, maker);
+            self.orders.insert(maker_key, maker.clone());
             if maker_leaves == 0 {
                 self.live_orders.remove(&trade.maker_order_id);
             }
@@ -707,7 +808,7 @@ impl SimulatedExchange {
                 None,
             ));
 
-            let mut taker = self.orders[&taker_key];
+            let mut taker = self.orders[&taker_key].clone();
             taker.cumulative_quantity_lots = taker
                 .cumulative_quantity_lots
                 .checked_add(trade.quantity_lots)
@@ -718,7 +819,7 @@ impl SimulatedExchange {
             } else {
                 OrderStatus::PartiallyFilled
             };
-            self.orders.insert(taker_key, taker);
+            self.orders.insert(taker_key, taker.clone());
             reports.push(self.report(
                 client_id,
                 request_id,
@@ -843,6 +944,13 @@ impl SimulatedExchange {
             client_id,
             request_id,
             client_order_id,
+            symbol: self
+                .orders
+                .get(&ClientOrderKey {
+                    client_id,
+                    client_order_id,
+                })
+                .map(|record| record.symbol.clone()),
             exchange_order_id,
             engine_sequence,
             status,
@@ -856,6 +964,50 @@ impl SimulatedExchange {
             reject_reason,
         }
     }
+}
+
+/// Thread-safe facade that makes each request transition linearizable. When
+/// requests race, mutex acquisition order defines the serialized exchange order;
+/// the assigned report sequences are monotone for that observed order.
+#[derive(Debug, Clone)]
+pub struct ConcurrentSimulatedExchange {
+    inner: Arc<Mutex<SimulatedExchange>>,
+}
+
+impl ConcurrentSimulatedExchange {
+    pub fn new(config: GatewayConfig) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SimulatedExchange::new(config))),
+        }
+    }
+
+    pub fn handle(&self, request: GatewayRequest) -> Result<GatewayResponse, GatewayError> {
+        self.inner
+            .lock()
+            .map_err(|_| GatewayError::LockPoisoned)?
+            .handle(request)
+    }
+
+    pub fn snapshot(&self) -> Result<ExchangeStateSnapshot, GatewayError> {
+        let exchange = self.inner.lock().map_err(|_| GatewayError::LockPoisoned)?;
+        Ok(ExchangeStateSnapshot {
+            state_fingerprint: exchange.state_fingerprint(),
+            orders: exchange.order_states(),
+        })
+    }
+
+    pub fn check_invariants(&self) -> Result<(), String> {
+        self.inner
+            .lock()
+            .map_err(|_| "simulated exchange state lock is poisoned".to_owned())?
+            .check_invariants()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeStateSnapshot {
+    pub state_fingerprint: u64,
+    pub orders: Vec<OrderStateSnapshot>,
 }
 
 fn side_code(side: Side) -> u8 {
@@ -934,8 +1086,19 @@ mod tests {
     }
 
     fn new_order(id: u64, side: Side, price: i64, quantity: u64) -> GatewayCommand {
+        new_order_for_symbol(default_symbol(), id, side, price, quantity)
+    }
+
+    fn new_order_for_symbol(
+        symbol: impl Into<String>,
+        id: u64,
+        side: Side,
+        price: i64,
+        quantity: u64,
+    ) -> GatewayCommand {
         GatewayCommand::New {
             client_order_id: id,
+            symbol: symbol.into(),
             side,
             price_ticks: price,
             quantity_lots: quantity,
@@ -1177,5 +1340,159 @@ mod tests {
         assert_eq!(one.requests, 3);
         assert_eq!(one.reports, 4);
         assert_eq!(one.rejections, 0);
+    }
+
+    #[test]
+    fn symbols_have_independent_books_and_reports_name_the_instrument() {
+        let mut exchange = SimulatedExchange::default();
+        let ask = exchange
+            .handle(request(
+                10,
+                1,
+                new_order_for_symbol("AAPL", 1, Side::Sell, 100, 2),
+            ))
+            .unwrap();
+        assert_eq!(ask.reports[0].symbol.as_deref(), Some("AAPL"));
+        exchange
+            .handle(request(
+                11,
+                1,
+                new_order_for_symbol("MSFT", 1, Side::Sell, 100, 1),
+            ))
+            .unwrap();
+        let buy = exchange
+            .handle(request(
+                20,
+                1,
+                new_order_for_symbol("AAPL", 1, Side::Buy, 100, 2),
+            ))
+            .unwrap();
+        assert_eq!(buy.reports.len(), 2);
+        assert!(buy
+            .reports
+            .iter()
+            .all(|report| report.symbol.as_deref() == Some("AAPL")));
+        assert_eq!(exchange.best_ask_for("AAPL"), None);
+        assert_eq!(exchange.best_ask_for("MSFT"), Some((100, 1)));
+        assert!(exchange.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn simultaneous_identical_requests_apply_once_and_replay_one_report_sequence() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let exchange = ConcurrentSimulatedExchange::new(GatewayConfig::default());
+        let barrier = Arc::new(Barrier::new(12));
+        let mut workers = Vec::new();
+        for _ in 0..12 {
+            let exchange = exchange.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                exchange
+                    .handle(request(44, 7, new_order(5, Side::Buy, 90, 3)))
+                    .unwrap()
+            }));
+        }
+        let responses: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| !response.replayed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.replayed)
+                .count(),
+            11
+        );
+        assert!(responses
+            .iter()
+            .all(|response| response.reports == responses[0].reports));
+        assert_eq!(exchange.snapshot().unwrap().orders.len(), 1);
+        exchange.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn concurrent_clients_receive_distinct_fills_with_global_report_sequences() {
+        use std::thread;
+
+        let exchange = ConcurrentSimulatedExchange::new(GatewayConfig::default());
+        const ORDER_COUNT: u64 = 24;
+        for index in 0..ORDER_COUNT {
+            exchange
+                .handle(request(
+                    100 + index,
+                    1,
+                    new_order_for_symbol("NYSE:AAPL", 1, Side::Sell, 100, 1),
+                ))
+                .unwrap();
+        }
+        exchange
+            .handle(request(
+                500,
+                1,
+                new_order_for_symbol("NASDAQ:AAPL", 1, Side::Sell, 100, 1),
+            ))
+            .unwrap();
+
+        let workers: Vec<_> = (0..ORDER_COUNT)
+            .map(|index| {
+                let exchange = exchange.clone();
+                thread::spawn(move || {
+                    exchange
+                        .handle(request(
+                            1_000 + index,
+                            1,
+                            new_order_for_symbol("NYSE:AAPL", 1, Side::Buy, 100, 1),
+                        ))
+                        .unwrap()
+                })
+            })
+            .collect();
+        let responses: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let mut report_sequences: Vec<_> = responses
+            .iter()
+            .flat_map(|response| response.reports.iter().map(|report| report.report_sequence))
+            .collect();
+        report_sequences.sort_unstable();
+        report_sequences.dedup();
+        assert_eq!(report_sequences.len(), (ORDER_COUNT * 2) as usize);
+        assert!(report_sequences
+            .windows(2)
+            .all(|pair| pair[1] == pair[0] + 1));
+        let mut maker_recipients = HashSet::new();
+        let mut buyer_recipients = HashSet::new();
+        for response in &responses {
+            assert_eq!(response.reports.len(), 2);
+            let maker = &response.reports[0];
+            let taker = &response.reports[1];
+            assert_eq!(maker.status, OrderStatus::Filled);
+            assert_eq!(taker.status, OrderStatus::Filled);
+            assert_eq!(maker.symbol.as_deref(), Some("NYSE:AAPL"));
+            assert_eq!(taker.symbol.as_deref(), Some("NYSE:AAPL"));
+            assert_eq!(taker.client_id, response.client_id);
+            assert_eq!(taker.request_id, response.request_id);
+            assert!((100..100 + ORDER_COUNT).contains(&maker.client_id));
+            assert!(maker_recipients.insert(maker.client_id));
+            assert!(buyer_recipients.insert(taker.client_id));
+            assert_eq!(maker.last_quantity_lots, 1);
+            assert_eq!(taker.last_quantity_lots, 1);
+        }
+        assert_eq!(maker_recipients.len(), ORDER_COUNT as usize);
+        assert_eq!(buyer_recipients.len(), ORDER_COUNT as usize);
+        let snapshot = exchange.snapshot().unwrap();
+        assert_eq!(snapshot.orders.len(), (ORDER_COUNT * 2 + 1) as usize);
+        assert_eq!(exchange.check_invariants(), Ok(()));
     }
 }
