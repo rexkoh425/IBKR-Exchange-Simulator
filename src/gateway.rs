@@ -21,6 +21,7 @@ pub struct OrderStateSnapshot {
     pub client_order_id: u64,
     pub exchange_order_id: u64,
     pub symbol: String,
+    pub priority_sequence: u64,
     pub side: Side,
     pub price_ticks: i64,
     pub order_quantity_lots: u64,
@@ -125,7 +126,14 @@ pub struct GatewayResponse {
     pub reports: Vec<ExecutionReport>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", content = "value", rename_all = "snake_case")]
+pub enum GatewayOutcome {
+    Response(GatewayResponse),
+    Error(GatewayError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GatewayError {
     InvalidRequestId,
     IdempotencyConflict,
@@ -161,6 +169,7 @@ struct OrderRecord {
     exchange_order_id: u64,
     last_request_id: u64,
     symbol: String,
+    priority_sequence: u64,
     side: Side,
     price_ticks: i64,
     order_quantity_lots: u64,
@@ -305,6 +314,7 @@ impl SimulatedExchange {
                 client_order_id: key.client_order_id,
                 exchange_order_id: record.exchange_order_id,
                 symbol: record.symbol.clone(),
+                priority_sequence: record.priority_sequence,
                 side: record.side,
                 price_ticks: record.price_ticks,
                 order_quantity_lots: record.order_quantity_lots,
@@ -315,6 +325,30 @@ impl SimulatedExchange {
             .collect();
         states.sort_by_key(|state| (state.client_id, state.client_order_id));
         states
+    }
+
+    pub fn book_orders(&self) -> Vec<OrderStateSnapshot> {
+        let mut orders: Vec<_> = self
+            .order_states()
+            .into_iter()
+            .filter(|order| {
+                matches!(
+                    order.status,
+                    OrderStatus::Accepted | OrderStatus::PartiallyFilled
+                )
+            })
+            .collect();
+        orders.sort_by(|left, right| {
+            left.symbol
+                .cmp(&right.symbol)
+                .then_with(|| side_code(left.side).cmp(&side_code(right.side)))
+                .then_with(|| match left.side {
+                    Side::Buy => right.price_ticks.cmp(&left.price_ticks),
+                    Side::Sell => left.price_ticks.cmp(&right.price_ticks),
+                })
+                .then_with(|| left.priority_sequence.cmp(&right.priority_sequence))
+        });
+        orders
     }
 
     pub fn check_invariants(&self) -> Result<(), String> {
@@ -396,6 +430,7 @@ impl SimulatedExchange {
             add(&mut hash, &record.exchange_order_id.to_le_bytes());
             add(&mut hash, &record.last_request_id.to_le_bytes());
             add(&mut hash, record.symbol.as_bytes());
+            add(&mut hash, &record.priority_sequence.to_le_bytes());
             add(
                 &mut hash,
                 &[side_code(record.side), status_code(record.status)],
@@ -426,6 +461,7 @@ impl SimulatedExchange {
         hash
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_new(
         &mut self,
         client_id: u64,
@@ -517,6 +553,7 @@ impl SimulatedExchange {
                 exchange_order_id,
                 last_request_id: request_id,
                 symbol,
+                priority_sequence: result.sequence.expect("accepted order has engine sequence"),
                 side,
                 price_ticks,
                 order_quantity_lots: quantity_lots,
@@ -733,6 +770,10 @@ impl SimulatedExchange {
                 exchange_order_id,
                 last_request_id: request_id,
                 symbol: old_record.symbol.clone(),
+                priority_sequence: replaced
+                    .replacement
+                    .sequence
+                    .expect("accepted replacement has engine sequence"),
                 side: old_record.side,
                 price_ticks,
                 order_quantity_lots: quantity_lots,

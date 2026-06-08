@@ -12,6 +12,7 @@ pub mod benchmark;
 pub mod eventlog;
 pub mod gateway;
 pub mod ibkr;
+pub mod journal;
 pub mod market_benchmark;
 pub mod market_data;
 pub mod pipeline;

@@ -1,13 +1,68 @@
 use equity_matching_engine::{
-    benchmark, gateway, ibkr, market_benchmark, pipeline, replay, MatchingEngine, OrderRequest,
-    Side,
+    benchmark, gateway, ibkr, journal, market_benchmark, pipeline, replay, MatchingEngine,
+    OrderRequest, Side,
 };
-use std::fs::File;
-use std::io::{stdin, stdout, BufReader};
+use std::fs::{File, OpenOptions};
+use std::io::{stdin, stdout, BufReader, Write};
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("exchange-recover") {
+        let mut journal_path = None;
+        let mut output_path = None;
+        let mut max_order_quantity_lots = u64::MAX;
+        let mut max_order_notional_ticks_lots = u128::MAX;
+        let mut args = std::env::args().skip(2);
+        while let Some(flag) = args.next() {
+            let value = args.next().unwrap_or_else(|| usage());
+            match flag.as_str() {
+                "--journal" => journal_path = Some(value),
+                "--output" => output_path = Some(value),
+                "--max-order-quantity" => {
+                    max_order_quantity_lots = value.parse().unwrap_or_else(|_| usage())
+                }
+                "--max-order-notional" => {
+                    max_order_notional_ticks_lots = value.parse().unwrap_or_else(|_| usage())
+                }
+                _ => usage(),
+            }
+        }
+        let path = journal_path.unwrap_or_else(|| usage());
+        let file = File::open(&path).unwrap_or_else(|error| {
+            eprintln!("cannot open exchange journal {path}: {error}");
+            std::process::exit(1);
+        });
+        let recovery = journal::recover(
+            BufReader::new(file),
+            gateway::GatewayConfig {
+                max_order_quantity_lots,
+                max_order_notional_ticks_lots,
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("exchange journal recovery failed: {error}");
+            std::process::exit(1);
+        });
+        let mut output: Box<dyn Write> = match output_path {
+            Some(path) => Box::new(File::create(&path).unwrap_or_else(|error| {
+                eprintln!("cannot create summary {path}: {error}");
+                std::process::exit(1);
+            })),
+            None => Box::new(stdout().lock()),
+        };
+        serde_json::to_writer(&mut output, &recovery.summary).unwrap_or_else(|error| {
+            eprintln!("cannot write recovery summary: {error}");
+            std::process::exit(1);
+        });
+        output.write_all(b"\n").unwrap_or_else(|error| {
+            eprintln!("cannot finish recovery summary: {error}");
+            std::process::exit(1);
+        });
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("exchange-sim") {
         let mut input = None;
+        let mut journal_path = None;
+        let mut summary_path = None;
         let mut max_order_quantity_lots = u64::MAX;
         let mut max_order_notional_ticks_lots = u128::MAX;
         let mut args = std::env::args().skip(2);
@@ -15,6 +70,8 @@ fn main() {
             let value = args.next().unwrap_or_else(|| usage());
             match flag.as_str() {
                 "--input" => input = Some(value),
+                "--journal" => journal_path = Some(value),
+                "--summary" => summary_path = Some(value),
                 "--max-order-quantity" => {
                     max_order_quantity_lots = value.parse().unwrap_or_else(|_| usage())
                 }
@@ -31,26 +88,74 @@ fn main() {
             }))),
             None => Box::new(stdin().lock()),
         };
-        let summary = gateway::run_jsonl(
-            reader,
-            stdout().lock(),
-            gateway::GatewayConfig {
-                max_order_quantity_lots,
-                max_order_notional_ticks_lots,
-            },
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("exchange simulation failed: {error}");
-            std::process::exit(1);
-        });
-        eprintln!(
-            "requests={},replayed_requests={},reports={},rejections={},state_fingerprint={:016x}",
-            summary.requests,
-            summary.replayed_requests,
-            summary.reports,
-            summary.rejections,
-            summary.state_fingerprint
-        );
+        let config = gateway::GatewayConfig {
+            max_order_quantity_lots,
+            max_order_notional_ticks_lots,
+        };
+        if let Some(path) = journal_path {
+            let existing = std::fs::metadata(&path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false);
+            let recovery = if existing {
+                let file = File::open(&path).unwrap_or_else(|error| {
+                    eprintln!("cannot read existing journal {path}: {error}");
+                    std::process::exit(1);
+                });
+                Some(
+                    journal::recover(BufReader::new(file), config).unwrap_or_else(|error| {
+                        eprintln!("cannot resume exchange journal: {error}");
+                        std::process::exit(1);
+                    }),
+                )
+            } else {
+                None
+            };
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|error| {
+                    eprintln!("cannot append exchange journal {path}: {error}");
+                    std::process::exit(1);
+                });
+            let mut journal = match recovery {
+                Some(recovery) => journal::ExchangeJournal::from_recovery(recovery, file),
+                None => journal::ExchangeJournal::new(config, file),
+            };
+            let summary = journal::run_jsonl_recorded(reader, stdout().lock(), &mut journal)
+                .unwrap_or_else(|error| {
+                    eprintln!("exchange simulation failed: {error}");
+                    std::process::exit(1);
+                });
+            if let Some(path) = summary_path {
+                let mut file = File::create(&path).unwrap_or_else(|error| {
+                    eprintln!("cannot create summary {path}: {error}");
+                    std::process::exit(1);
+                });
+                serde_json::to_writer(&mut file, &summary).unwrap_or_else(|error| {
+                    eprintln!("cannot write summary {path}: {error}");
+                    std::process::exit(1);
+                });
+                file.write_all(b"\n").unwrap_or_else(|error| {
+                    eprintln!("cannot finish summary {path}: {error}");
+                    std::process::exit(1);
+                });
+            }
+        } else {
+            let summary =
+                gateway::run_jsonl(reader, stdout().lock(), config).unwrap_or_else(|error| {
+                    eprintln!("exchange simulation failed: {error}");
+                    std::process::exit(1);
+                });
+            eprintln!(
+                "requests={},replayed_requests={},reports={},rejections={},state_fingerprint={:016x}",
+                summary.requests,
+                summary.replayed_requests,
+                summary.reports,
+                summary.rejections,
+                summary.state_fingerprint
+            );
+        }
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("ibkr-capture") {
@@ -506,7 +611,7 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|market-data-benchmark|market-data-spsc-benchmark|ibkr-capture|market-replay|exchange-sim [options]");
+    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|market-data-benchmark|market-data-spsc-benchmark|ibkr-capture|market-replay|exchange-sim|exchange-recover [options]");
     std::process::exit(2);
 }
 
