@@ -12,6 +12,9 @@ rtrb = "=0.4.1"
 core_affinity = "=0.8.3"
 ibapi = { version = "=5.7.0", default-features = false, features = ["sync"] }
 
+[dev-dependencies]
+proptest = "1"
+
 [lib]
 name = "equity_matching_engine"
 path = "src/lib.rs"

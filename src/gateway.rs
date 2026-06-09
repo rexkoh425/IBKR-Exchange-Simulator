@@ -1462,6 +1462,77 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_conflicting_retries_accept_one_command_and_reject_the_other() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let exchange = ConcurrentSimulatedExchange::new(GatewayConfig::default());
+        let barrier = Arc::new(Barrier::new(2));
+        let requests = [
+            request(9, 41, new_order(1, Side::Buy, 99, 2)),
+            request(9, 41, new_order(2, Side::Buy, 98, 3)),
+        ];
+        let workers: Vec<_> = requests
+            .into_iter()
+            .map(|request| {
+                let exchange = exchange.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    exchange.handle(request)
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(GatewayError::IdempotencyConflict))
+                .count(),
+            1
+        );
+        let state = exchange.snapshot().unwrap();
+        assert_eq!(state.orders.len(), 1);
+        assert_eq!(exchange.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn clients_cannot_cancel_or_replace_another_clients_order() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(100, 1, new_order(55, Side::Sell, 100, 4)))
+            .unwrap();
+        let before = exchange.book_orders();
+        let cancel = exchange
+            .handle(request(200, 1, GatewayCommand::Cancel { client_order_id: 55 }))
+            .unwrap();
+        assert_eq!(cancel.reports[0].reject_reason, Some(GatewayRejectReason::UnknownClientOrderId));
+        let replace = exchange
+            .handle(request(
+                200,
+                2,
+                GatewayCommand::Replace {
+                    client_order_id: 55,
+                    replacement_client_order_id: 56,
+                    price_ticks: 99,
+                    quantity_lots: 3,
+                },
+            ))
+            .unwrap();
+        assert_eq!(replace.reports[0].reject_reason, Some(GatewayRejectReason::UnknownClientOrderId));
+        assert_eq!(exchange.book_orders(), before);
+        let owner_cancel = exchange
+            .handle(request(100, 2, GatewayCommand::Cancel { client_order_id: 55 }))
+            .unwrap();
+        assert_eq!(owner_cancel.reports[0].status, OrderStatus::Cancelled);
+        assert_eq!(exchange.live_order_count(), 0);
+    }
+
+    #[test]
     fn concurrent_clients_receive_distinct_fills_with_global_report_sequences() {
         use std::thread;
 

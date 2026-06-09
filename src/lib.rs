@@ -18,6 +18,9 @@ pub mod market_data;
 pub mod pipeline;
 pub mod replay;
 
+#[cfg(test)]
+mod reference_matcher;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
     #[serde(alias = "buy")]
