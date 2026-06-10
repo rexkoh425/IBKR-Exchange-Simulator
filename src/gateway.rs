@@ -1508,9 +1508,18 @@ mod tests {
             .unwrap();
         let before = exchange.book_orders();
         let cancel = exchange
-            .handle(request(200, 1, GatewayCommand::Cancel { client_order_id: 55 }))
+            .handle(request(
+                200,
+                1,
+                GatewayCommand::Cancel {
+                    client_order_id: 55,
+                },
+            ))
             .unwrap();
-        assert_eq!(cancel.reports[0].reject_reason, Some(GatewayRejectReason::UnknownClientOrderId));
+        assert_eq!(
+            cancel.reports[0].reject_reason,
+            Some(GatewayRejectReason::UnknownClientOrderId)
+        );
         let replace = exchange
             .handle(request(
                 200,
@@ -1523,10 +1532,19 @@ mod tests {
                 },
             ))
             .unwrap();
-        assert_eq!(replace.reports[0].reject_reason, Some(GatewayRejectReason::UnknownClientOrderId));
+        assert_eq!(
+            replace.reports[0].reject_reason,
+            Some(GatewayRejectReason::UnknownClientOrderId)
+        );
         assert_eq!(exchange.book_orders(), before);
         let owner_cancel = exchange
-            .handle(request(100, 2, GatewayCommand::Cancel { client_order_id: 55 }))
+            .handle(request(
+                100,
+                2,
+                GatewayCommand::Cancel {
+                    client_order_id: 55,
+                },
+            ))
             .unwrap();
         assert_eq!(owner_cancel.reports[0].status, OrderStatus::Cancelled);
         assert_eq!(exchange.live_order_count(), 0);

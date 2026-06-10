@@ -10,6 +10,7 @@ use crate::gateway::{
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
+use std::time::Instant;
 
 pub const EXCHANGE_JOURNAL_SCHEMA_VERSION: u16 = 1;
 
@@ -133,7 +134,9 @@ impl JournalSummary {
                 } else {
                     self.accepted_requests += 1;
                 }
-                self.execution_reports.extend(response.reports.clone());
+                if !response.replayed {
+                    self.execution_reports.extend(response.reports.clone());
+                }
             }
             GatewayOutcome::Error(_) => self.protocol_rejections += 1,
         }
@@ -230,12 +233,13 @@ impl<W: Write> ExchangeJournal<W> {
         self.next_sequence = sequence;
         self.summary.entries = sequence;
         self.summary.record_outcome(&outcome);
-        self.summary.finish(&self.exchange);
         Ok(outcome)
     }
 
     pub fn summary(&self) -> JournalSummary {
-        self.summary.clone()
+        let mut summary = self.summary.clone();
+        summary.finish(&self.exchange);
+        summary
     }
 
     pub fn exchange(&self) -> &SimulatedExchange {
@@ -275,15 +279,25 @@ pub fn run_jsonl_recorded<R: BufRead, O: Write, J: Write>(
 /// Validate every journal frame, replay requests, and compare stored outcomes
 /// and state checksums before returning the reconstructed exchange.
 pub fn recover<R: BufRead>(
-    mut reader: R,
+    reader: R,
     config: GatewayConfig,
 ) -> Result<RecoveryResult, JournalError> {
+    recover_profiled(reader, config).map(|(result, _)| result)
+}
+
+/// Recover a journal and return per-entry validation/replay service times.
+pub fn recover_profiled<R: BufRead>(
+    mut reader: R,
+    config: GatewayConfig,
+) -> Result<(RecoveryResult, Vec<u64>), JournalError> {
     let mut exchange = SimulatedExchange::new(config);
     let mut summary = JournalSummary::new();
     let mut line_number = 0_u64;
     let mut expected_sequence = 1_u64;
     let mut bytes = Vec::new();
+    let mut latencies = Vec::new();
     loop {
+        let entry_started = Instant::now();
         bytes.clear();
         if reader.read_until(b'\n', &mut bytes)? == 0 {
             break;
@@ -341,6 +355,7 @@ pub fn recover<R: BufRead>(
         }
         summary.entries = entry.journal_sequence;
         summary.record_outcome(&actual_outcome);
+        latencies.push(entry_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         expected_sequence = expected_sequence
             .checked_add(1)
             .ok_or(JournalError::SequenceExhausted)?;
@@ -352,7 +367,7 @@ pub fn recover<R: BufRead>(
             detail: format!("recovered exchange invariant failed: {detail}"),
         })?;
     summary.finish(&exchange);
-    Ok(RecoveryResult { exchange, summary })
+    Ok((RecoveryResult { exchange, summary }, latencies))
 }
 
 fn entry_checksum(
@@ -493,6 +508,22 @@ mod tests {
         assert_eq!(recovered.summary.entries, 2);
         assert_eq!(recovered.summary.accepted_requests, 1);
         assert_eq!(recovered.summary.protocol_rejections, 1);
+    }
+
+    #[test]
+    fn idempotent_retry_does_not_duplicate_journal_execution_history() {
+        let mut bytes = Vec::new();
+        let mut journal = ExchangeJournal::new(GatewayConfig::default(), &mut bytes);
+        let request = requests()[0].clone();
+        journal.handle(request.clone()).unwrap();
+        journal.handle(request).unwrap();
+        let summary = journal.summary();
+        assert_eq!(summary.entries, 2);
+        assert_eq!(summary.accepted_requests, 2);
+        assert_eq!(summary.execution_reports.len(), 1);
+        drop(journal);
+        let recovered = recover(Cursor::new(&bytes), GatewayConfig::default()).unwrap();
+        assert_eq!(recovered.summary, summary);
     }
 
     #[test]
