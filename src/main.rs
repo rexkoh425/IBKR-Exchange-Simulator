@@ -1,6 +1,6 @@
 use equity_matching_engine::{
-    benchmark, gateway, ibkr, journal, market_benchmark, pipeline, replay, MatchingEngine,
-    OrderRequest, Side,
+    benchmark, gateway, gateway_benchmark, ibkr, journal, market_benchmark, pipeline, replay,
+    MatchingEngine, OrderRequest, Side,
 };
 use std::fs::{File, OpenOptions};
 use std::io::{stdin, stdout, BufReader, Write};
@@ -156,6 +156,135 @@ fn main() {
                 summary.state_fingerprint
             );
         }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("exchange-benchmark") {
+        let mut events = 100_000_usize;
+        let mut trials = 5_usize;
+        let mut seed = 20261110_u64;
+        let mut core = None;
+        let mut args = std::env::args().skip(2);
+        while let Some(flag) = args.next() {
+            let value = args.next().unwrap_or_else(|| usage());
+            match flag.as_str() {
+                "--events" => events = value.parse().unwrap_or_else(|_| usage()),
+                "--trials" => trials = value.parse().unwrap_or_else(|_| usage()),
+                "--seed" => seed = value.parse().unwrap_or_else(|_| usage()),
+                "--core" => core = Some(value.parse::<usize>().unwrap_or_else(|_| usage())),
+                _ => usage(),
+            }
+        }
+        if events == 0 || trials == 0 {
+            usage();
+        }
+        let affinity = core
+            .map(|id| core_affinity::set_for_current(core_affinity::CoreId { id }))
+            .unwrap_or(false);
+        if core.is_some() && !affinity {
+            eprintln!("failed to pin benchmark thread to requested core {core:?}");
+            std::process::exit(2);
+        }
+        eprintln!("requested_core={core:?},affinity_set={affinity},commands={events},trials={trials},seed={seed},workload=frozen_new_orders_seeded_by_splitmix64");
+        let input = gateway_benchmark::frozen_workload(events, seed);
+        let journal_path = std::env::temp_dir().join(format!(
+            "exchange-bench-{}-{}.jsonl",
+            std::process::id(),
+            seed
+        ));
+        println!("stage,trial,commands,throughput_per_second,p50_ns,p95_ns,p99_ns,p999_ns,max_ns,mismatches,state_checksum,journal_bytes,elapsed_ns");
+        let mut expected_gateway_checksum = None;
+        for trial in 1..=trials {
+            let core_result = benchmark::run_trial(events, seed);
+            println!(
+                "core,{trial},{},{:.2},{},{},{},{},{},0,{:016x},0,{}",
+                core_result.events,
+                core_result.completed_events_per_second,
+                core_result.p50_service_ns,
+                core_result.p95_service_ns,
+                core_result.p99_service_ns,
+                core_result.p999_service_ns,
+                core_result.max_service_ns,
+                core_result.final_state_fingerprint,
+                core_result.elapsed.as_nanos()
+            );
+            let mut gateway_result =
+                gateway_benchmark::run_gateway(&input, trial).unwrap_or_else(|error| {
+                    eprintln!("gateway benchmark failed: {error}");
+                    std::process::exit(1);
+                });
+            let stable_checksum =
+                *expected_gateway_checksum.get_or_insert(gateway_result.state_checksum);
+            if gateway_result.state_checksum != stable_checksum {
+                gateway_result.mismatches += 1;
+            }
+            println!(
+                "{},{},{},{:.2},{},{},{},{},{},{},{:016x},{},{}",
+                gateway_result.stage,
+                gateway_result.trial,
+                gateway_result.commands,
+                gateway_result.throughput_per_second,
+                gateway_result.p50_ns,
+                gateway_result.p95_ns,
+                gateway_result.p99_ns,
+                gateway_result.p999_ns,
+                gateway_result.max_ns,
+                gateway_result.mismatches,
+                gateway_result.state_checksum,
+                gateway_result.journal_bytes,
+                gateway_result.elapsed_ns
+            );
+            let (mut journal_result, journal_bytes) =
+                gateway_benchmark::run_journal(&input, trial, &journal_path).unwrap_or_else(
+                    |error| {
+                        eprintln!("journal benchmark failed: {error}");
+                        std::process::exit(1);
+                    },
+                );
+            if journal_result.state_checksum != gateway_result.state_checksum {
+                journal_result.mismatches += 1;
+            }
+            println!(
+                "{},{},{},{:.2},{},{},{},{},{},{},{:016x},{},{}",
+                journal_result.stage,
+                journal_result.trial,
+                journal_result.commands,
+                journal_result.throughput_per_second,
+                journal_result.p50_ns,
+                journal_result.p95_ns,
+                journal_result.p99_ns,
+                journal_result.p999_ns,
+                journal_result.max_ns,
+                journal_result.mismatches,
+                journal_result.state_checksum,
+                journal_result.journal_bytes,
+                journal_result.elapsed_ns
+            );
+            let mut replay_result = gateway_benchmark::run_replay(&journal_bytes, trial)
+                .unwrap_or_else(|error| {
+                    eprintln!("replay benchmark failed: {error}");
+                    std::process::exit(1);
+                });
+            if replay_result.state_checksum != journal_result.state_checksum {
+                replay_result.mismatches += 1;
+            }
+            println!(
+                "{},{},{},{:.2},{},{},{},{},{},{},{:016x},{},{}",
+                replay_result.stage,
+                replay_result.trial,
+                replay_result.commands,
+                replay_result.throughput_per_second,
+                replay_result.p50_ns,
+                replay_result.p95_ns,
+                replay_result.p99_ns,
+                replay_result.p999_ns,
+                replay_result.max_ns,
+                replay_result.mismatches,
+                replay_result.state_checksum,
+                replay_result.journal_bytes,
+                replay_result.elapsed_ns
+            );
+        }
+        let _ = std::fs::remove_file(journal_path);
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("ibkr-capture") {
@@ -408,6 +537,7 @@ fn main() {
         let mut seed = 2026_u64;
         let mut trials = 5_usize;
         let mut warmup_events = 100_000_usize;
+        let mut core = None;
         while let Some(flag) = args.next() {
             let value = args.next().unwrap_or_else(|| usage());
             match flag.as_str() {
@@ -415,11 +545,19 @@ fn main() {
                 "--seed" => seed = value.parse().unwrap_or_else(|_| usage()),
                 "--trials" => trials = value.parse().unwrap_or_else(|_| usage()),
                 "--warmup-events" => warmup_events = value.parse().unwrap_or_else(|_| usage()),
+                "--core" => core = Some(value.parse::<usize>().unwrap_or_else(|_| usage())),
                 _ => usage(),
             }
         }
         if events == 0 || trials == 0 {
             usage();
+        }
+        let affinity = core
+            .map(|id| core_affinity::set_for_current(core_affinity::CoreId { id }))
+            .unwrap_or(false);
+        if core.is_some() && !affinity {
+            eprintln!("failed to pin benchmark thread to requested core {core:?}");
+            std::process::exit(2);
         }
         let warmup = benchmark::run_trial(warmup_events.max(1), seed ^ u64::MAX);
         eprintln!(
@@ -427,8 +565,8 @@ fn main() {
             warmup.events, warmup.seed, warmup.final_state_fingerprint
         );
         eprintln!(
-            "machine={}",
-            std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "unknown".into())
+            "machine={},requested_core={core:?},affinity_set={affinity}",
+            std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "unknown".into()),
         );
         eprintln!("os={}", std::env::consts::OS);
         if let Ok(version) = std::process::Command::new("rustc")
@@ -611,7 +749,7 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: equity-matching-engine benchmark|pipeline-benchmark|market-data-benchmark|market-data-spsc-benchmark|ibkr-capture|market-replay|exchange-sim|exchange-recover [options]");
+    eprintln!("usage: equity-matching-engine benchmark|exchange-benchmark|pipeline-benchmark|market-data-benchmark|market-data-spsc-benchmark|ibkr-capture|market-replay|exchange-sim|exchange-recover [options]");
     std::process::exit(2);
 }
 

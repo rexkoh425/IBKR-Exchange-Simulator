@@ -95,8 +95,8 @@ The simulator enforces optional quantity and price-times-quantity notional
 limits with `--max-order-quantity` and `--max-order-notional`. Replace uses a
 new client order ID, cancels the old order, and sends the replacement to the
 back of its new price level; rejected replacements leave the old order live.
-All clients share the same deterministic matching book, and client IDs scope
-client order IDs. This is an in-process JSONL simulator, not a network FIX
+Clients share deterministic books per symbol, and client IDs scope client
+order IDs. This is an in-process JSONL simulator, not a network FIX
 gateway, and does not model exchange latency, auctions, fees, or venue-specific
 order types.
 
@@ -105,6 +105,15 @@ full fill, and an idempotent retry. The gateway checks book/index consistency
 after replay and returns a state fingerprint for repeat-run comparisons. See the
 [gateway verification report](benchmarks/exchange-gateway-verification-2026-11-10.md)
 for correctness evidence, reproduction and matcher benchmark limits.
+
+To persist and recover simulated exchange commands, pass `--journal
+exchange.jsonl` to `exchange-sim`; use `exchange-recover --journal
+exchange.jsonl --output recovered-summary.json` in a separate process to
+validate and reconstruct state. `exchange-benchmark --events 10000 --trials 5
+--seed 20261110 --core 0` runs the frozen-workload core, gateway, journaling,
+and replay stages. See
+[`docs/exchange-order-handling.md`](docs/exchange-order-handling.md) for the
+order rules and persistence/benchmark boundaries.
 
 ## Event log and replay
 
