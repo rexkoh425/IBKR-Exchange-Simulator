@@ -17,6 +17,8 @@ Gateway service time includes JSON parsing, request validation/idempotency seque
 
 All five gateway, journal and replay state checksums matched (`846d557e2be02611`), and every journal replay validated recorded outcomes. The journal was 1,047,310 bytes for 1,000 commands. The low journal/replay throughput is real for this implementation: it computes a full sorted exchange-state fingerprint for every command, so command cost grows with retained order and idempotency history. A 10,000-command exploratory journal trial measured 159 commands/s and about 62.8 seconds, so it was stopped after that first trial instead of being presented as a five-trial result.
 
+The checked-in fixture was also run through `exchange-sim --journal`, recovered by a separate `exchange-recover` process, then extended with one new client request and recovered again. Both original/recovered and resumed/recovered summary files compared byte-for-byte equal; the resumed journal had six contiguous records, eight unique execution reports and final state checksum `17756027732600482575`.
+
 The five-trial gateway benchmark process used 6.28 seconds of sampled CPU time and reached 10.15 MB sampled peak working set. These are process-wide values across all four stages, not per-stage resource attribution; the CSV reports per-stage elapsed time and latency. The pinned 10M core rerun below used 17.14 seconds CPU and 629 MB sampled peak working set, including workload generation and latency sample storage. Working-set sampling interval was 20 ms.
 
 ## 10M pinned matcher rerun
