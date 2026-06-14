@@ -1,162 +1,148 @@
-# Equity Matching Engine
+# Equity Matching Engine & Market Replay
 
-A deterministic Rust limit-order matching engine for synthetic exchange
-experiments. The implementation provides price-time priority, partial
-and multi-level fills, cancellation, replace-as-cancel-and-new, integer tick/lot
-arithmetic, and invariant checks. The IBKR capture command is read-only and never places orders.
-Each price level stores a FIFO chain keyed by order IDs, allowing cancellation
-to unlink an order without shifting the rest of the queue.
+**A deterministic, single-process exchange simulator and market-data laboratory written in Rust.** Explore FIFO price-time matching, client order lifecycles, bounded event queues, and replayable market data with repeatable correctness and performance checks.
 
-## Run
+> This is a research and portfolio project. The IBKR adapter captures market data only; the simulator does not route orders to a broker or exchange. Synthetic benchmark results are not live-market performance claims.
 
-```powershell
-cargo run --release
-cargo test
+## Project snapshot
+
+| | |
+| --- | --- |
+| **Language** | Rust 2021 |
+| **Core** | FIFO price-time matching with integer ticks and lots |
+| **Gateway** | In-process JSONL simulator with multiple logical clients |
+| **Replay** | Deterministic event and journal recovery with checksums |
+| **Market data** | Provider-neutral L1/L2 types and an optional read-only IBKR capture adapter |
+| **Queues** | Bounded blocking and SPSC pipeline benchmarks |
+| **Verification** | Unit tests, proptest, independent reference model, fixed-seed benchmarks |
+
+## Measured results
+
+Results below were measured on an AMD Ryzen 9 9900X / Windows x86_64 release build. See the linked reports and raw trial files for exact workload, affinity, timing boundaries, and limitations.
+
+| Area | Result | What the number means |
+| --- | --- | --- |
+| **Matching core** | **5.91M commands/s median; 400 ns p99** | Five pinned trials of 10M synthetic mixed submit/cancel commands on one logical CPU. |
+| **Independent correctness** | **100,000 commands; 5 seeds; 0 mismatches** | Production gateway checked against a deliberately different flat-vector matcher; proptest adds generated sequences. |
+| **Bounded SPSC queue** | **1.0003–1.0005M events/s; 0 loss; 0.597–0.623 us p99** | Three pinned 10M-event trials. Consumer computes a checksum; this does not include matching or persistence. |
+| **Parsed simulated gateway** | **519.7k requests/s median; 8.7 us p99** | Five frozen-workload trials of 1,000 JSONL requests per trial. Treat as an initial small-workload baseline. |
+| **Gateway with journal** | **1.585k requests/s median; 1.323 ms p99** | Includes per-command full-state checksum, JSONL append, and flush. This is the current measured journal bottleneck. |
+
+The matcher rerun was below an earlier 6.68M/s result, so no speedup is claimed. The SPSC result is a simple synthetic queue test, not evidence that the IBKR capture path sustains one million live market events per second. The exchange journal flushes records but does not call `fsync` or `FlushFileBuffers`.
+
+- [Benchmark report and gateway/replay raw trials](benchmarks/exchange-gateway-benchmark-2026-11-10.md)
+- [Pinned 10M matcher raw trials](benchmarks/matcher-10m-pinned-rerun-2026-11-10.csv) and [prior matcher run](benchmarks/matcher-10m-2026-11-09.md)
+- [Pinned SPSC queue report](benchmarks/pinned-spsc-10m-2026-11-09.md)
+- [SPSC telemetry optimization report and paired raw trials](benchmarks/pipeline-optimization-2026-11-10.md)
+
+## What it can be used for
+
+- **Exchange mechanics experiments:** study price-time priority, maker-price fills, partial execution, cancellation, and replacement priority.
+- **Order lifecycle and client behavior:** exercise idempotent retries, duplicate IDs, ownership checks, risk limits, and execution reports without placing real orders.
+- **Deterministic replay:** reproduce a JSONL session, inspect market-depth gaps, validate a journal after restart, and compare stable state checksums.
+- **Low-latency engineering practice:** measure matcher service time and queue behavior under frozen synthetic workloads; compare changes without changing the workload.
+- **IBKR market-data development:** capture and normalize read-only Level 1 quotes/trades and positional Level 2 depth from an already-running TWS or IB Gateway session.
+
+## Architecture
+
+The two data paths are independent today; the market-data replay path does not feed the simulated exchange gateway automatically.
+
+```mermaid
+flowchart LR
+  subgraph MarketData[Market-data path]
+    TWS[IBKR TWS or Gateway] --> Capture[Read-only capture and normalization]
+    Capture --> MarketJSONL[Market-data JSONL]
+    MarketJSONL --> Replay[Gap-aware deterministic replay]
+  end
+
+  subgraph Exchange[Simulated order path]
+    Clients[JSONL client requests] --> Gateway[In-process order gateway]
+    Gateway --> Books[Per-symbol FIFO matching books]
+    Books --> Reports[Sequenced execution reports]
+    Gateway --> Journal[Versioned exchange journal]
+    Journal --> Recovery[Validated restart and replay]
+  end
+
+  subgraph QueueBench[Standalone queue benchmark]
+    Producer[Synthetic producer] --> Ring[Bounded SPSC ring]
+    Ring --> Consumer[Checksum consumer]
+  end
 ```
 
-Prices are integer ticks and quantities are integer lots. Each accepted submit
-or cancel advances a local sequence. A replacement requires a fresh order ID so
-that the new order receives no inherited queue priority.
+## Matching and gateway behavior
 
-## Synthetic matcher benchmark
+- Integer price ticks and quantity lots avoid floating-point comparisons in the matching core.
+- Each symbol has an independent book. The best price trades first; orders at the same price trade FIFO. Fills execute at the resting order's price.
+- A replace cancels the old order and submits a new client order ID, giving it new time priority. A rejected replacement leaves the old order live.
+- Request IDs are scoped to a client. An identical retry returns cached reports; reuse with changed command content is rejected. Client ownership is enforced for cancels and replacements.
+- A fill generates sequenced execution reports for both the resting and incoming clients. Quantity/notional risk limits are configurable.
+- The journal stores requests, outcomes, checksums, and monotone journal sequence numbers. Recovery rejects sequence gaps, corrupt entries, and a truncated final record.
 
-Run `cargo run --release -- benchmark --events 1000000 --seed 2026 --trials 5`
-to generate a deterministic mixed submit/cancel workload before timing the
-matcher. It runs a warm-up, then emits one CSV row per measured trial. The
-output reports submit/cancel/fill counts, commands/s, per-command p50/p95/p99
-and maximum service time, and the final state fingerprint. The seeded workload
-includes crossing prices and actual fills. Timing includes per-command clock
-reads. This isolated matcher harness is not an open-loop queue or broker-feed
-measurement.
+Full rules and persistence limits are in [the order-handling specification](docs/exchange-order-handling.md).
 
-The first 10M-event pinned run is documented in
-[`benchmarks/matcher-10m-2026-11-09.md`](benchmarks/matcher-10m-2026-11-09.md),
-with raw trial rows in the adjacent CSV. Treat that evidence as specific to its
-recorded machine, workload, and timing boundary.
+## Quick start
 
-## Bounded pipeline benchmark
+```powershell
+cargo build --release
+cargo test
+cargo run --release -- exchange-sim --input fixtures/exchange-session.jsonl
+```
 
-`cargo run --release -- pipeline-benchmark --events 10000000 --rate 1000000 --capacity 65536 --trials 5`
-runs an open-loop synthetic producer through a bounded blocking channel and
-checks the completed event count and payload checksum. It measures scheduled-
-arrival-to-processing latency and producer-outstanding high-water mark. The consumer
-currently performs only a deterministic checksum operation; this is a queue
-baseline, not a matching-plus-persistence or IBKR pipeline measurement. Add
-`--queue spsc` to benchmark a bounded `rtrb` SPSC ring. Use SPSC only when the
-architecture truly has one producer and one consumer. Both paths retain and
-count events under pressure instead of silently overwriting them.
-Pin the benchmark threads with `--producer-core N --consumer-core M`; use IDs
-reported as `available_cpu_ids` by the program and verify both pin-success
-columns in the CSV. An example configuration is `--rate 1005000 --queue spsc
---producer-core 0 --consumer-core 12`.
-The 10M-event trial results are in
-[`benchmarks/pipeline-10m-2026-11-09.md`](benchmarks/pipeline-10m-2026-11-09.md).
-The first comparison on this Windows machine reached about 998k completed
-events/s for both queues. In a corrected 1M-event run, SPSC queue residence was
-below 10 microseconds in two trials but had a 286.7 microsecond p99 outlier in
-the third; throughput was below 1M/s throughout. This does not establish the
-target. See [queue residence results](benchmarks/queue-residence-1m-2026-11-09.md)
-and the [earlier comparison](benchmarks/queue-2m-2026-11-09.md). Queue residence
-and scheduled-arrival-to-completion are reported separately.
+Example request:
 
-With SPSC producer/consumer pinned to CPUs 0 and 12 and the offer rate set to
-1.005M/s, three 10M-event trials completed at 1.0003–1.0005M/s with 0.597–0.623
-µs p99 scheduled-to-complete and exact checksums. This meets the synthetic queue
-target under that configuration; millisecond maximum outliers remain. Full
-provenance and limits are in
-[`benchmarks/pinned-spsc-10m-2026-11-09.md`](benchmarks/pinned-spsc-10m-2026-11-09.md).
+```json
+{"client_id":7,"request_id":1,"command":{"type":"new","client_order_id":101,"symbol":"AAPL","side":"Buy","price_ticks":19000,"quantity_lots":25}}
+```
 
-### SPSC telemetry optimization
+Prices are integer ticks and quantities are integer lots. The fixture shows an acknowledgement, partial fill, cancel/replace, full fill, and idempotent retry. Run `exchange-sim` without `--input` to read JSONL from standard input.
 
-`pipeline-benchmark --queue spsc` samples queue occupancy every 64 pushes by
-default. Set `--occupancy-sample-interval 1` to measure after every push, or
-`--burst-size 32` to replay 32-event arrival bursts at the configured average
-rate. The benchmark validates count, event order and an order-sensitive
-checksum, and reports full-queue retries. See the [10-trial before/after
-results](benchmarks/pipeline-optimization-2026-11-10.md) and its raw CSV files.
-The measured synthetic throughput improvement does not represent IBKR market
-data throughput; use `market-data-benchmark` for isolated normalization,
-JSONL persistence, decoding and replay stages.
-It does not establish those metrics for the IBKR capture or persistence path.
+### Persist and recover a simulated session
 
-## Simulated exchange order gateway
+```powershell
+cargo run --release -- exchange-sim --input fixtures/exchange-session.jsonl --journal exchange.jsonl --summary original.json
+cargo run --release -- exchange-recover --journal exchange.jsonl --output recovered.json
+```
 
-`cargo run --release -- exchange-sim --input fixtures/exchange-session.jsonl`
-replays client order requests as newline-delimited JSON and writes execution
-reports as JSONL. Input can also come from standard input. Each request includes
-`client_id`, a client-scoped idempotent `request_id`, and a tagged `command`:
-`new`, `cancel`, or `replace`. The gateway emits monotone report sequence
-numbers, exchange order IDs, engine sequence numbers, fill prices/quantities,
-cumulative fills, leaves, and explicit reject reasons. A repeated identical
-request replays its original reports; reusing a request ID for a different
-command is a protocol error.
+Compare the summaries to confirm reconstructed order state, reports, and final checksum. The journal is separate from IBKR market-depth recordings and currently does not promise power-loss durability.
 
-The simulator enforces optional quantity and price-times-quantity notional
-limits with `--max-order-quantity` and `--max-order-notional`. Replace uses a
-new client order ID, cancels the old order, and sends the replacement to the
-back of its new price level; rejected replacements leave the old order live.
-Clients share deterministic books per symbol, and client IDs scope client
-order IDs. This is an in-process JSONL simulator, not a network FIX
-gateway, and does not model exchange latency, auctions, fees, or venue-specific
-order types.
+### Optional IBKR read-only capture
 
-The example fixture exercises acknowledgement, partial fill, cancel/replace,
-full fill, and an idempotent retry. The gateway checks book/index consistency
-after replay and returns a state fingerprint for repeat-run comparisons. See the
-[gateway verification report](benchmarks/exchange-gateway-verification-2026-11-10.md)
-for correctness evidence, reproduction and matcher benchmark limits.
+Copy `.env.example` to `.env`, start and log in to TWS or IB Gateway, then run:
 
-To persist and recover simulated exchange commands, pass `--journal
-exchange.jsonl` to `exchange-sim`; use `exchange-recover --journal
-exchange.jsonl --output recovered-summary.json` in a separate process to
-validate and reconstruct state. `exchange-benchmark --events 10000 --trials 5
---seed 20261110 --core 0` runs the frozen-workload core, gateway, journaling,
-and replay stages. See
-[`docs/exchange-order-handling.md`](docs/exchange-order-handling.md) for the
-order rules and persistence/benchmark boundaries.
+```powershell
+cargo run --release -- ibkr-capture
+```
 
-## Event log and replay
+The adapter uses the local socket settings in `.env` and writes market-data JSONL under `data/ibkr/`. It does not send orders. Actual IBKR connection, entitlements, disk behavior, and capture completeness must be verified in the user's own environment; they are not established by the synthetic tests here.
 
-`eventlog` provides schema-versioned JSONL records for synthetic submit/cancel
-commands. The recorder uses a local, contiguous ordinal, and replay rejects
-unknown schema versions or gaps in that ordinal. Replaying the same stream
-produces the same receipts and stable state fingerprint. The fingerprint covers
-the engine state needed for future commands; it is not a cryptographic digest.
+## Reproduce benchmarks
 
-`market_data` defines versioned L1 quote/trade events and venue-scoped L2
-position-based insert/update/delete records. Replay handles snapshots, gaps,
-disconnects, and invalid books. JSONL round trips are supported. These are
-provider-neutral replay types and fixtures.
+Matcher core, pinned to a logical CPU on Windows:
 
-## IBKR read-only capture
+```powershell
+cargo run --release -- benchmark --events 10000000 --seed 20261109 --trials 5 --warmup-events 100000 --core 0
+```
 
-Copy `.env.example` to `.env`, then configure the socket/contract values. Start
-TWS or IB Gateway and log in there; the API client does not take account
-credentials. Run `cargo run --release -- ibkr-capture`. It subscribes to L1 and
-positional market depth and writes timestamped JSONL under `data/ibkr/`. The
-capture stores raw SDK debug payloads for inspection by default. Set
-`IBKR_CAPTURE_RAW_PAYLOAD=false` to skip formatting and writing those raw strings;
-the normalized market events remain, but the JSONL loses the original SDK text
-needed for raw-payload audit/debug inspection. A synthetic paired benchmark
-measured about 98% higher throughput without this formatting, but that is not a
-live IBKR or disk-persistence measurement. Code 317 depth reset is recorded
-explicitly. Terminal stream errors are logged as gaps. A bounded
-writer queue (set by `IBKR_QUEUE_CAPACITY`) moves JSON encoding and disk writes
-off the polling loop. If that queue fills, capture stops and appends a gap
-record after draining queued events; it does not claim a complete capture.
+Full simulated gateway, journal, and replay stages:
 
-This is an initial connected capture, not a lossless production feed handler.
-The SDK has internal subscription buffering, the capture polls both streams on
-one thread, and process/disk/network failures can still lose data. The local
-bounded writer queue detects pressure but cannot bound the SDK's own internal
-queues. A local
-timestamp/ordinal only gives capture order, not exchange order. IBKR market-depth
-initial rows do not provide an authoritative end-of-snapshot marker here, so do
-not treat the reconstructed book as valid without a separate completeness rule.
-Market data and depth access require the appropriate IBKR permissions and
-subscriptions; depth venues and line limits constrain what is available.
+```powershell
+cargo run --release -- exchange-benchmark --events 1000 --trials 5 --seed 20261110 --core 0
+```
 
-## Project status
+Bounded single-producer/single-consumer checksum pipeline:
 
-This repository is being implemented in phases. No live market data or broker
-connectivity has been verified in this environment.
+```powershell
+cargo run --release -- pipeline-benchmark --queue spsc --events 10000000 --rate 1005000 --capacity 65536 --trials 3 --producer-core 0 --consumer-core 12
+```
+
+The exchange benchmark prints CSV rows. `--core` requests thread affinity and exits if pinning fails. For the pipeline benchmark, check the printed pin-success values and preserve the complete CSV output. Do not compare pinned and unpinned runs as if affinity were an optimization.
+
+## Correctness and scope
+
+`cargo test` includes the independent reference comparisons, property-generated command sequences, journal corruption/truncation and recovery cases, and multi-client concurrency tests. The reference matcher intentionally uses a flat order vector and scans for matches, unlike the production matcher's indexed price levels and FIFO queues.
+
+The gateway is in-process JSONL, not TCP, FIX, or a production order-management system. It models limit orders and does not model auctions, fees, venue-specific order types, exchange/network latency, or live order routing. Market-data capture has not been qualified as a lossless production feed handler. The queue benchmark's zero-loss claim applies only to its tested synthetic workload, bounded queue, retry policy, and hardware.
+
+## Built with
+
+Rust, Serde/JSON, `rtrb` SPSC ring buffer, `core_affinity`, `ibapi`, and proptest.
