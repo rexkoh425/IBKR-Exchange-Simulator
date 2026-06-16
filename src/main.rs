@@ -65,6 +65,7 @@ fn main() {
         let mut summary_path = None;
         let mut max_order_quantity_lots = u64::MAX;
         let mut max_order_notional_ticks_lots = u128::MAX;
+        let mut journal_options = journal::JournalOptions::default();
         let mut args = std::env::args().skip(2);
         while let Some(flag) = args.next() {
             let value = args.next().unwrap_or_else(|| usage());
@@ -77,6 +78,13 @@ fn main() {
                 }
                 "--max-order-notional" => {
                     max_order_notional_ticks_lots = value.parse().unwrap_or_else(|_| usage())
+                }
+                "--state-checksum-interval" => {
+                    journal_options.full_state_checksum_interval =
+                        value.parse().unwrap_or_else(|_| usage())
+                }
+                "--flush-every" => {
+                    journal_options.flush_every_entries = value.parse().unwrap_or_else(|_| usage())
                 }
                 _ => usage(),
             }
@@ -119,8 +127,12 @@ fn main() {
                     std::process::exit(1);
                 });
             let mut journal = match recovery {
-                Some(recovery) => journal::ExchangeJournal::from_recovery(recovery, file),
-                None => journal::ExchangeJournal::new(config, file),
+                Some(recovery) => journal::ExchangeJournal::from_recovery_with_options(
+                    recovery,
+                    file,
+                    journal_options,
+                ),
+                None => journal::ExchangeJournal::with_options(config, file, journal_options),
             };
             let summary = journal::run_jsonl_recorded(reader, stdout().lock(), &mut journal)
                 .unwrap_or_else(|error| {
@@ -163,6 +175,7 @@ fn main() {
         let mut trials = 5_usize;
         let mut seed = 20261110_u64;
         let mut core = None;
+        let mut journal_options = journal::JournalOptions::default();
         let mut args = std::env::args().skip(2);
         while let Some(flag) = args.next() {
             let value = args.next().unwrap_or_else(|| usage());
@@ -171,6 +184,13 @@ fn main() {
                 "--trials" => trials = value.parse().unwrap_or_else(|_| usage()),
                 "--seed" => seed = value.parse().unwrap_or_else(|_| usage()),
                 "--core" => core = Some(value.parse::<usize>().unwrap_or_else(|_| usage())),
+                "--journal-checksum-interval" => {
+                    journal_options.full_state_checksum_interval =
+                        value.parse().unwrap_or_else(|_| usage())
+                }
+                "--journal-flush-every" => {
+                    journal_options.flush_every_entries = value.parse().unwrap_or_else(|_| usage())
+                }
                 _ => usage(),
             }
         }
@@ -184,7 +204,7 @@ fn main() {
             eprintln!("failed to pin benchmark thread to requested core {core:?}");
             std::process::exit(2);
         }
-        eprintln!("requested_core={core:?},affinity_set={affinity},commands={events},trials={trials},seed={seed},workload=frozen_new_orders_seeded_by_splitmix64");
+        eprintln!("requested_core={core:?},affinity_set={affinity},commands={events},trials={trials},seed={seed},journal_checksum_interval={},journal_flush_every={},workload=frozen_new_orders_seeded_by_splitmix64", journal_options.full_state_checksum_interval, journal_options.flush_every_entries);
         let input = gateway_benchmark::frozen_workload(events, seed);
         let journal_path = std::env::temp_dir().join(format!(
             "exchange-bench-{}-{}.jsonl",
@@ -234,12 +254,11 @@ fn main() {
                 gateway_result.elapsed_ns
             );
             let (mut journal_result, journal_bytes) =
-                gateway_benchmark::run_journal(&input, trial, &journal_path).unwrap_or_else(
-                    |error| {
+                gateway_benchmark::run_journal(&input, trial, &journal_path, journal_options)
+                    .unwrap_or_else(|error| {
                         eprintln!("journal benchmark failed: {error}");
                         std::process::exit(1);
-                    },
-                );
+                    });
             if journal_result.state_checksum != gateway_result.state_checksum {
                 journal_result.mismatches += 1;
             }

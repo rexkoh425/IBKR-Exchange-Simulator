@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::time::Instant;
 
-pub const EXCHANGE_JOURNAL_SCHEMA_VERSION: u16 = 1;
+pub const LEGACY_EXCHANGE_JOURNAL_SCHEMA_VERSION: u16 = 1;
+pub const EXCHANGE_JOURNAL_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,8 +22,28 @@ pub struct ExchangeJournalEntry {
     pub journal_sequence: u64,
     pub request: GatewayRequest,
     pub outcome: GatewayOutcome,
-    pub state_checksum: u64,
+    #[serde(default)]
+    pub state_checksum: Option<u64>,
     pub checksum: u64,
+}
+
+/// Controls the journal's full-state verification and writer flush cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalOptions {
+    /// Store and verify a full fingerprint every N commands. One verifies each
+    /// record; larger intervals avoid repeated whole-state traversals.
+    pub full_state_checksum_interval: u64,
+    /// Flush the writer after this many records. This is not an fsync policy.
+    pub flush_every_entries: u64,
+}
+
+impl Default for JournalOptions {
+    fn default() -> Self {
+        Self {
+            full_state_checksum_interval: 4096,
+            flush_every_entries: 1,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -176,24 +197,48 @@ pub struct ExchangeJournal<W: Write> {
     writer: W,
     next_sequence: u64,
     summary: JournalSummary,
+    options: JournalOptions,
+    pending_flush_entries: u64,
 }
 
 impl<W: Write> ExchangeJournal<W> {
     pub fn new(config: GatewayConfig, writer: W) -> Self {
+        Self::with_options(config, writer, JournalOptions::default())
+    }
+
+    pub fn with_options(config: GatewayConfig, writer: W, options: JournalOptions) -> Self {
         Self {
             exchange: SimulatedExchange::new(config),
             writer,
             next_sequence: 0,
             summary: JournalSummary::new(),
+            options: JournalOptions {
+                full_state_checksum_interval: options.full_state_checksum_interval.max(1),
+                flush_every_entries: options.flush_every_entries.max(1),
+            },
+            pending_flush_entries: 0,
         }
     }
 
     pub fn from_recovery(recovery: RecoveryResult, writer: W) -> Self {
+        Self::from_recovery_with_options(recovery, writer, JournalOptions::default())
+    }
+
+    pub fn from_recovery_with_options(
+        recovery: RecoveryResult,
+        writer: W,
+        options: JournalOptions,
+    ) -> Self {
         Self {
             exchange: recovery.exchange,
             writer,
             next_sequence: recovery.summary.entries,
             summary: recovery.summary,
+            options: JournalOptions {
+                full_state_checksum_interval: options.full_state_checksum_interval.max(1),
+                flush_every_entries: options.flush_every_entries.max(1),
+            },
+            pending_flush_entries: 0,
         }
     }
 
@@ -206,8 +251,9 @@ impl<W: Write> ExchangeJournal<W> {
             Ok(response) => GatewayOutcome::Response(response),
             Err(error) => GatewayOutcome::Error(error),
         };
-        let state_checksum = self.exchange.state_fingerprint();
-        let checksum = entry_checksum(
+        let state_checksum = (sequence % self.options.full_state_checksum_interval == 0)
+            .then(|| self.exchange.state_fingerprint());
+        let checksum = entry_checksum_v2(
             EXCHANGE_JOURNAL_SCHEMA_VERSION,
             sequence,
             &request,
@@ -228,12 +274,22 @@ impl<W: Write> ExchangeJournal<W> {
             )))
         })?;
         self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
-
+        self.pending_flush_entries += 1;
         self.next_sequence = sequence;
         self.summary.entries = sequence;
         self.summary.record_outcome(&outcome);
+        if self.pending_flush_entries >= self.options.flush_every_entries {
+            self.flush()?;
+        }
         Ok(outcome)
+    }
+
+    /// Flush buffered records to the underlying writer. This does not request
+    /// durable storage from the operating system.
+    pub fn flush(&mut self) -> Result<(), JournalError> {
+        self.writer.flush()?;
+        self.pending_flush_entries = 0;
+        Ok(())
     }
 
     pub fn summary(&self) -> JournalSummary {
@@ -246,8 +302,9 @@ impl<W: Write> ExchangeJournal<W> {
         &self.exchange
     }
 
-    pub fn into_writer(self) -> W {
-        self.writer
+    pub fn into_writer(mut self) -> Result<W, JournalError> {
+        self.flush()?;
+        Ok(self.writer)
     }
 }
 
@@ -272,6 +329,7 @@ pub fn run_jsonl_recorded<R: BufRead, O: Write, J: Write>(
         serde_json::to_writer(&mut output, &outcome).map_err(|error| error.to_string())?;
         output.write_all(b"\n").map_err(|error| error.to_string())?;
     }
+    journal.flush().map_err(|error| error.to_string())?;
     output.flush().map_err(|error| error.to_string())?;
     Ok(journal.summary())
 }
@@ -315,12 +373,6 @@ pub fn recover_profiled<R: BufRead>(
                 line: line_number,
                 detail: error.to_string(),
             })?;
-        if entry.schema_version != EXCHANGE_JOURNAL_SCHEMA_VERSION {
-            return Err(JournalError::UnsupportedVersion {
-                line: line_number,
-                version: entry.schema_version,
-            });
-        }
         if entry.journal_sequence != expected_sequence {
             return Err(JournalError::SequenceMismatch {
                 line: line_number,
@@ -328,13 +380,33 @@ pub fn recover_profiled<R: BufRead>(
                 actual: entry.journal_sequence,
             });
         }
-        let calculated_checksum = entry_checksum(
-            entry.schema_version,
-            entry.journal_sequence,
-            &entry.request,
-            &entry.outcome,
-            entry.state_checksum,
-        );
+        let calculated_checksum = match entry.schema_version {
+            LEGACY_EXCHANGE_JOURNAL_SCHEMA_VERSION => entry_checksum_v1(
+                entry.schema_version,
+                entry.journal_sequence,
+                &entry.request,
+                &entry.outcome,
+                entry
+                    .state_checksum
+                    .ok_or_else(|| JournalError::CorruptRecord {
+                        line: line_number,
+                        detail: "schema v1 record has no full state checksum".into(),
+                    })?,
+            ),
+            EXCHANGE_JOURNAL_SCHEMA_VERSION => entry_checksum_v2(
+                entry.schema_version,
+                entry.journal_sequence,
+                &entry.request,
+                &entry.outcome,
+                entry.state_checksum,
+            ),
+            version => {
+                return Err(JournalError::UnsupportedVersion {
+                    line: line_number,
+                    version,
+                });
+            }
+        };
         if calculated_checksum != entry.checksum {
             return Err(JournalError::ChecksumMismatch { line: line_number });
         }
@@ -345,13 +417,15 @@ pub fn recover_profiled<R: BufRead>(
         if actual_outcome != entry.outcome {
             return Err(JournalError::OutcomeMismatch { line: line_number });
         }
-        let actual_state_checksum = exchange.state_fingerprint();
-        if actual_state_checksum != entry.state_checksum {
-            return Err(JournalError::StateChecksumMismatch {
-                line: line_number,
-                expected: entry.state_checksum,
-                actual: actual_state_checksum,
-            });
+        if let Some(expected_state_checksum) = entry.state_checksum {
+            let actual_state_checksum = exchange.state_fingerprint();
+            if actual_state_checksum != expected_state_checksum {
+                return Err(JournalError::StateChecksumMismatch {
+                    line: line_number,
+                    expected: expected_state_checksum,
+                    actual: actual_state_checksum,
+                });
+            }
         }
         summary.entries = entry.journal_sequence;
         summary.record_outcome(&actual_outcome);
@@ -370,12 +444,26 @@ pub fn recover_profiled<R: BufRead>(
     Ok((RecoveryResult { exchange, summary }, latencies))
 }
 
-fn entry_checksum(
+fn entry_checksum_v1(
     schema_version: u16,
     sequence: u64,
     request: &GatewayRequest,
     outcome: &GatewayOutcome,
     state_checksum: u64,
+) -> u64 {
+    let encoded = serde_json::to_vec(&(schema_version, sequence, request, outcome, state_checksum))
+        .expect("journal checksum fields serialize");
+    encoded.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn entry_checksum_v2(
+    schema_version: u16,
+    sequence: u64,
+    request: &GatewayRequest,
+    outcome: &GatewayOutcome,
+    state_checksum: Option<u64>,
 ) -> u64 {
     let encoded = serde_json::to_vec(&(schema_version, sequence, request, outcome, state_checksum))
         .expect("journal checksum fields serialize");
@@ -390,6 +478,10 @@ mod tests {
     use crate::gateway::{GatewayCommand, GatewayError, GatewayRequest};
     use crate::Side;
     use std::io::Cursor;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     fn requests() -> Vec<GatewayRequest> {
         vec![
@@ -549,5 +641,176 @@ mod tests {
             recover(Cursor::new(corrupted), GatewayConfig::default()),
             Err(JournalError::CorruptRecord { .. } | JournalError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn schema_v1_journals_remain_recoverable() {
+        let request = requests()[0].clone();
+        let mut exchange = SimulatedExchange::new(GatewayConfig::default());
+        let outcome = GatewayOutcome::Response(exchange.handle(request.clone()).unwrap());
+        let state_checksum = exchange.state_fingerprint();
+        let entry = ExchangeJournalEntry {
+            schema_version: LEGACY_EXCHANGE_JOURNAL_SCHEMA_VERSION,
+            journal_sequence: 1,
+            checksum: entry_checksum_v1(
+                LEGACY_EXCHANGE_JOURNAL_SCHEMA_VERSION,
+                1,
+                &request,
+                &outcome,
+                state_checksum,
+            ),
+            request,
+            outcome: outcome.clone(),
+            state_checksum: Some(state_checksum),
+        };
+        let mut bytes = serde_json::to_vec(&entry).unwrap();
+        bytes.push(b'\n');
+        let recovered = recover(Cursor::new(bytes), GatewayConfig::default()).unwrap();
+        assert_eq!(recovered.summary.entries, 1);
+        assert_eq!(recovered.summary.state_checksum, state_checksum);
+        assert_eq!(recovered.summary.execution_reports.len(), 1);
+    }
+
+    #[test]
+    fn schema_v1_can_be_resumed_and_appended_as_schema_v2() {
+        let request = requests()[0].clone();
+        let mut exchange = SimulatedExchange::new(GatewayConfig::default());
+        let outcome = GatewayOutcome::Response(exchange.handle(request.clone()).unwrap());
+        let state_checksum = exchange.state_fingerprint();
+        let entry = ExchangeJournalEntry {
+            schema_version: LEGACY_EXCHANGE_JOURNAL_SCHEMA_VERSION,
+            journal_sequence: 1,
+            checksum: entry_checksum_v1(
+                LEGACY_EXCHANGE_JOURNAL_SCHEMA_VERSION,
+                1,
+                &request,
+                &outcome,
+                state_checksum,
+            ),
+            request,
+            outcome,
+            state_checksum: Some(state_checksum),
+        };
+        let mut legacy = serde_json::to_vec(&entry).unwrap();
+        legacy.push(b'\n');
+        let recovery = recover(Cursor::new(&legacy), GatewayConfig::default()).unwrap();
+
+        let mut appended = Vec::new();
+        let mut journal = ExchangeJournal::from_recovery(recovery, &mut appended);
+        journal.handle(requests()[1].clone()).unwrap();
+        drop(journal);
+        legacy.extend_from_slice(&appended);
+        let recovered = recover(Cursor::new(legacy), GatewayConfig::default()).unwrap();
+        assert_eq!(recovered.summary.entries, 2);
+        assert_eq!(recovered.summary.execution_reports.len(), 3);
+    }
+
+    #[test]
+    fn schema_v2_checkpoints_verify_full_state_and_skip_other_traversals() {
+        let mut bytes = Vec::new();
+        let options = JournalOptions {
+            full_state_checksum_interval: 8,
+            flush_every_entries: 4,
+        };
+        let mut journal =
+            ExchangeJournal::with_options(GatewayConfig::default(), &mut bytes, options);
+        for n in 1..=20 {
+            journal
+                .handle(GatewayRequest {
+                    client_id: n % 3 + 1,
+                    request_id: n,
+                    command: GatewayCommand::New {
+                        client_order_id: n,
+                        symbol: "CHK".into(),
+                        side: if n % 2 == 0 { Side::Buy } else { Side::Sell },
+                        price_ticks: 100 + (n % 5) as i64,
+                        quantity_lots: 1,
+                    },
+                })
+                .unwrap();
+        }
+        let expected_summary = journal.summary();
+        journal.flush().unwrap();
+        drop(journal);
+
+        let mut entries: Vec<ExchangeJournalEntry> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 20);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.schema_version, EXCHANGE_JOURNAL_SCHEMA_VERSION);
+            assert_eq!(
+                entry.state_checksum.is_some(),
+                (index as u64 + 1).is_multiple_of(8)
+            );
+        }
+        let recovered = recover(Cursor::new(&bytes), GatewayConfig::default()).unwrap();
+        assert_eq!(recovered.summary, expected_summary);
+
+        let checkpoint = &mut entries[7];
+        checkpoint.state_checksum = checkpoint.state_checksum.map(|sum| sum.wrapping_add(1));
+        checkpoint.checksum = entry_checksum_v2(
+            checkpoint.schema_version,
+            checkpoint.journal_sequence,
+            &checkpoint.request,
+            &checkpoint.outcome,
+            checkpoint.state_checksum,
+        );
+        let mut corrupted_checkpoint = Vec::new();
+        for entry in entries {
+            serde_json::to_writer(&mut corrupted_checkpoint, &entry).unwrap();
+            corrupted_checkpoint.push(b'\n');
+        }
+        assert!(matches!(
+            recover(Cursor::new(corrupted_checkpoint), GatewayConfig::default()),
+            Err(JournalError::StateChecksumMismatch { line: 8, .. })
+        ));
+    }
+
+    #[test]
+    fn configurable_flush_batches_records_and_flushes_on_finish() {
+        #[derive(Clone, Default)]
+        struct CountingWriter {
+            bytes: Rc<RefCell<Vec<u8>>>,
+            flushes: Rc<Cell<usize>>,
+        }
+
+        impl Write for CountingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes.set(self.flushes.get() + 1);
+                Ok(())
+            }
+        }
+
+        let writer = CountingWriter::default();
+        let flushes = writer.flushes.clone();
+        let bytes = writer.bytes.clone();
+        let options = JournalOptions {
+            full_state_checksum_interval: 8,
+            flush_every_entries: 3,
+        };
+        let mut journal = ExchangeJournal::with_options(GatewayConfig::default(), writer, options);
+        for request in requests().into_iter().take(4) {
+            journal.handle(request).unwrap();
+        }
+        assert_eq!(flushes.get(), 1);
+        let writer = journal.into_writer().unwrap();
+        assert_eq!(flushes.get(), 2);
+        drop(writer);
+        assert_eq!(
+            bytes
+                .borrow()
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .count(),
+            4
+        );
     }
 }

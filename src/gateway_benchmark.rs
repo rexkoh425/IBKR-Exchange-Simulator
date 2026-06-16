@@ -1,7 +1,7 @@
 //! Frozen-workload benchmarks for the simulated exchange request path.
 
 use crate::gateway::{GatewayConfig, GatewayOutcome, GatewayRequest, SimulatedExchange};
-use crate::journal::{self, ExchangeJournal};
+use crate::journal::{self, ExchangeJournal, JournalOptions};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Cursor, Write};
@@ -91,10 +91,11 @@ pub fn run_journal(
     bytes: &[u8],
     trial: usize,
     path: &std::path::Path,
+    options: JournalOptions,
 ) -> Result<(StageResult, Vec<u8>), String> {
     let file = File::create(path).map_err(|error| error.to_string())?;
     let writer = BufWriter::new(file);
-    let mut journal = ExchangeJournal::new(GatewayConfig::default(), writer);
+    let mut journal = ExchangeJournal::with_options(GatewayConfig::default(), writer, options);
     let mut latencies = Vec::with_capacity(bytes.iter().filter(|byte| **byte == b'\n').count());
     let start = Instant::now();
     let mut mismatches = 0;
@@ -110,7 +111,7 @@ pub fn run_journal(
     }
     let elapsed = start.elapsed();
     let checksum = journal.exchange().state_fingerprint();
-    let mut writer = journal.into_writer();
+    let mut writer = journal.into_writer().map_err(|error| error.to_string())?;
     writer.flush().map_err(|error| error.to_string())?;
     drop(writer);
     let journal_bytes = std::fs::read(path).map_err(|error| error.to_string())?;
