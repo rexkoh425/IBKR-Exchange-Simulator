@@ -64,7 +64,7 @@ Each work item records objective, dependencies, approach, acceptance evidence, t
 | Task | Objective, dependencies and approach | Acceptance, tests and benchmark evidence | Est. |
 | --- | --- | --- | ---: |
 | JOUR-01 | Profile current v1 per-event full-state fingerprinting and preserve raw baseline. | Profile identifies cost by stage; baseline files remain unchanged; 1K/10K/100K scaling data. | 2 |
-| JOUR-02 | Add versioned periodic full-state checkpoints plus per-record integrity chain. | v1 remains readable; v2 replays every command/outcome, validates checkpoints and recomputes a full final fingerprint. | 4 |
+| JOUR-02 | Add versioned periodic full-state checkpoints plus per-record checksums. | v1 remains readable; v2 replays every command/outcome, validates checksums/checkpoints and recomputes a full final fingerprint. | 4 |
 | JOUR-03 | Add configurable flush/batch/sync policies with explicit persistence guarantees. | Injected write/flush failures stop processing; flush and sync semantics documented and tested. | 3 |
 | JOUR-04 | Add snapshot/checkpoint recovery and bounded replay from latest checkpoint. | Snapshot state equals replayed state; corrupt, truncated and mismatched snapshots fail closed. | 3 |
 | JOUR-05 | Benchmark journal/recovery scaling and resource use against the retained baseline. | Frozen 1K/10K/100K datasets where feasible; p50/p95/p99/p99.9/max, throughput and resource provenance. | 2 |

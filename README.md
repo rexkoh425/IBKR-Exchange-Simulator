@@ -26,11 +26,14 @@ Results below were measured on an AMD Ryzen 9 9900X / Windows x86_64 release bui
 | **Independent correctness** | **100,000 commands; 5 seeds; 0 mismatches** | Production gateway checked against a deliberately different flat-vector matcher; proptest adds generated sequences. |
 | **Bounded SPSC queue** | **1.0003–1.0005M events/s; 0 loss; 0.597–0.623 us p99** | Three pinned 10M-event trials. Consumer computes a checksum; this does not include matching or persistence. |
 | **Parsed simulated gateway** | **519.7k requests/s median; 8.7 us p99** | Five frozen-workload trials of 1,000 JSONL requests per trial. Treat as an initial small-workload baseline. |
-| **Gateway with journal** | **1.585k requests/s median; 1.323 ms p99** | Includes per-command full-state checksum, JSONL append, and flush. This is the current measured journal bottleneck. |
+| **Gateway with journal** | **157.6k requests/s median; 24.1 us p99 at 1K** | Schema v2 checkpoints full state every 4,096 commands by default and validates each replayed command. |
+| **Journal scaling** | **119.9k/s at 10K; 36.3k/s at 100K** | Five pinned runs per workload, p99 of 26.8 us / 32.6 us. Full-state checkpoint work still creates rare long maximum-latency spikes. |
+| **Journal replay** | **37.6k records/s; 11.6 us p99 at 100K** | Replays and validates the entire journal; final state fingerprint is recomputed. |
 
-The matcher rerun was below an earlier 6.68M/s result, so no speedup is claimed. The SPSC result is a simple synthetic queue test, not evidence that the IBKR capture path sustains one million live market events per second. The exchange journal flushes records but does not call `fsync` or `FlushFileBuffers`.
+The matcher rerun was below an earlier 6.68M/s result, so no speedup is claimed. The journal's measured v2 throughput depends on checkpoint interval and workload size; a full fingerprint per entry reproduces the slower ~1.6K/s baseline. The SPSC result is a simple synthetic queue test, not evidence that the IBKR capture path sustains one million live market events per second. The exchange journal flushes records but does not call `fsync` or `FlushFileBuffers`.
 
 - [Benchmark report and gateway/replay raw trials](benchmarks/exchange-gateway-benchmark-2026-11-10.md)
+- [Journal v2 checkpoint scaling and raw trials](benchmarks/journal-v2-scaling-2026-11-10.md)
 - [Pinned 10M matcher raw trials](benchmarks/matcher-10m-pinned-rerun-2026-11-10.csv) and [prior matcher run](benchmarks/matcher-10m-2026-11-09.md)
 - [Pinned SPSC queue report](benchmarks/pinned-spsc-10m-2026-11-09.md)
 - [SPSC telemetry optimization report and paired raw trials](benchmarks/pipeline-optimization-2026-11-10.md)
@@ -99,11 +102,11 @@ Prices are integer ticks and quantities are integer lots. The fixture shows an a
 ### Persist and recover a simulated session
 
 ```powershell
-cargo run --release -- exchange-sim --input fixtures/exchange-session.jsonl --journal exchange.jsonl --summary original.json
+cargo run --release -- exchange-sim --input fixtures/exchange-session.jsonl --journal exchange.jsonl --summary original.json --state-checksum-interval 4096
 cargo run --release -- exchange-recover --journal exchange.jsonl --output recovered.json
 ```
 
-Compare the summaries to confirm reconstructed order state, reports, and final checksum. The journal is separate from IBKR market-depth recordings and currently does not promise power-loss durability.
+Compare the summaries to confirm reconstructed order state, reports, and final checksum. Schema v2 writes a full-state checkpoint every 4,096 commands by default; use `--state-checksum-interval 1` for a full state fingerprint on every record. `--flush-every N` batches writer flushes (default 1). The journal is separate from IBKR market-depth recordings and does not promise power-loss durability.
 
 ### Optional IBKR read-only capture
 

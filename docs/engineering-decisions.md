@@ -32,10 +32,10 @@ This ledger records decisions that constrain implementation. Revisit a decision 
 
 ## DEC-005 — Journal checksum policy must separate integrity from state verification
 
-- **Status:** Proposed for batch 1
-- **Decision:** Retain schema-v1 recovery. Add a versioned mode that verifies every replayed command outcome and record checksum, performs full exchange-state fingerprints at configured checkpoints, and computes a fresh full fingerprint at recovery completion. Keep a full-checksum-every-entry option for differential validation.
+- **Status:** Accepted, batch 1
+- **Decision:** Retain schema-v1 recovery. Schema v2 verifies every replayed command outcome and record checksum, performs full exchange-state fingerprints at configured checkpoints, and computes a fresh full fingerprint at recovery completion. Default to a checkpoint every 4,096 commands, with interval 1 available for full-checksum-every-entry verification.
 - **Reason:** The current v1 path sorts and serializes growing order/request history for every record, causing ~1.6K commands/s on the 1K benchmark. Replacing full hashes with a rolling hash alone would weaken state verification; checkpointed full hashes plus final recomputation preserve an independent state check while reducing repeated traversals.
-- **Consequence:** Schema version, checkpoint interval and flush policy must be explicit in records/CLI/docs. Benchmarks compare equivalent input and retain v1 data. Rolling or record checksums are integrity aids, not cryptographic proofs or substitutes for reference tests.
+- **Consequence:** Schema version and checkpoint presence are explicit per record; checkpoint and flush policies are exposed in CLI/benchmark options. Benchmarks compare equivalent input and retain v1 artifacts. Record checksums are non-cryptographic integrity aids, not proofs or substitutes for reference tests.
 
 ## DEC-006 — Flush is not crash durability
 

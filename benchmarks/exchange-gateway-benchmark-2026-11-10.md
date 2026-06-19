@@ -30,3 +30,5 @@ Raw rows are in [the matcher CSV artifact](matcher-10m-pinned-rerun-2026-11-10.c
 ## Limits
 
 This is a synchronous synthetic request workload, not a live IBKR or network gateway benchmark. It does not measure open-loop queue residence, market-data ingestion, kernel/network scheduling, or production persistence durability. The journal flushes but does not call `fsync`/`FlushFileBuffers`; see the [order-handling specification](../docs/exchange-order-handling.md).
+
+**Journal follow-up:** the gateway/journal rows above are the schema-v1 full-checksum baseline. Schema v2 checkpoint policies and 1K/10K/100K scaling are measured separately in the [journal v2 report](journal-v2-scaling-2026-11-10.md); the historical raw rows above are retained unchanged.
