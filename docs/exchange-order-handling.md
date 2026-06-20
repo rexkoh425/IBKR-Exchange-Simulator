@@ -15,6 +15,18 @@
 - Cancel removes remaining quantity. Replace is cancel plus a newly accepted order with a new client order ID and loses all previous time priority. A rejected replacement leaves the original order unchanged.
 - Each execution report has a monotonically increasing global report sequence and is delivered to the client represented by that report. A fill produces reports for both maker and taker.
 
+## Advanced order policy (implementation pending)
+
+The first advanced-order slice will use these explicit semantics; they are not yet accepted by the current gateway API:
+
+- **GTC:** the existing default. Match any immediately executable quantity and rest the remainder.
+- **IOC:** execute immediately against all eligible visible price levels. Cancel any remainder without adding it to the book. The client receives fill reports and a final cancelled/leaves-zero report when quantity remains; an IOC with no match is accepted then cancelled.
+- **FOK:** preflight the total eligible visible quantity while holding the exchange's serialized sequencing point. If it is insufficient, reject without changing the book, allocating an engine sequence, or allocating an exchange order ID. The client order ID remains consumed under the gateway's existing no-reuse rule. If sufficient, execute the whole quantity atomically; no remainder may rest.
+- **Post-only:** reject an order if it would execute against the current opposite book. Do not reprice or adjust it. Rejection leaves the book and engine sequence unchanged; the client order ID remains consumed.
+- **Replacement:** remains cancel-and-new with no inherited priority. The replacement's explicit TIF/post-only flags apply to the new order; omitted flags use GTC/non-post-only defaults.
+
+FOK preflight and commit must be performed under the same serialized exchange operation. These semantics apply only to visible liquidity in this simulator and do not claim exchange protocol compatibility.
+
 The production matcher uses indexed price levels and FIFO queues. A test-only reference model uses a flat order vector and scans it for the best eligible order, intentionally trading speed for implementation independence. It compares per-command outcomes, fills, visible resting-book order, quotes and periodic complete state fingerprints.
 
 ## Journal and recovery guarantees

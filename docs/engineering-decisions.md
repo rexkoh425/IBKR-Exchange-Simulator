@@ -64,3 +64,10 @@ This ledger records decisions that constrain implementation. Revisit a decision 
 - **Decision:** FIX/OUCH may inform terminology and state design, but protocol compliance is claimed only after implementing and validating the actual wire specification.
 - **Reason:** A JSON simulator and selected protocol concepts are not interoperable FIX/OUCH implementations.
 - **Consequence:** Current gateway remains explicitly in-process JSONL until a separately tested network protocol exists.
+
+## DEC-010 — Initial advanced order semantics
+
+- **Status:** Accepted specification; code pending
+- **Decision:** GTC remains the default; IOC takes available crossing liquidity then cancels its remainder; FOK uses a serialized all-or-none preflight over visible book quantity; post-only rejects a would-take order without repricing.
+- **Reason:** These policies are deterministic with the current single sequencing point and preserve existing price-time priority for any quantity that rests.
+- **Consequence:** FOK check and match commit must be atomic under the same serialized request. An unfillable FOK or crossing post-only request does not mutate book state or allocate an engine sequence/order ID. The client order ID remains reserved under current gateway semantics. Replacement flags govern the new order and never transfer old priority.
