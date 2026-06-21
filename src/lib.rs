@@ -38,6 +38,32 @@ pub struct OrderRequest {
     pub quantity_lots: QuantityLots,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeInForce {
+    #[default]
+    Gtc,
+    Ioc,
+    Fok,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderOptions {
+    #[serde(default)]
+    pub time_in_force: TimeInForce,
+    #[serde(default)]
+    pub post_only: bool,
+}
+
+impl Default for OrderOptions {
+    fn default() -> Self {
+        Self {
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trade {
     pub sequence: Sequence,
@@ -55,6 +81,9 @@ pub enum RejectReason {
     DuplicateOrderId,
     UnknownOrderId,
     SequenceExhausted,
+    InvalidOrderOptions,
+    PostOnlyWouldTake,
+    FillOrKillUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,14 +154,50 @@ impl MatchingEngine {
 
     /// Match at eligible best prices, with each execution priced at the resting order.
     pub fn submit(&mut self, request: OrderRequest) -> SubmitResult {
+        self.submit_with_options(request, OrderOptions::default())
+    }
+
+    /// Check order policy without mutating IDs, sequence numbers, or book state.
+    pub fn preflight(
+        &self,
+        request: OrderRequest,
+        options: OrderOptions,
+    ) -> Result<(), RejectReason> {
         if request.price_ticks <= 0 {
-            return SubmitResult::rejected(RejectReason::InvalidPrice);
+            return Err(RejectReason::InvalidPrice);
         }
         if request.quantity_lots == 0 {
-            return SubmitResult::rejected(RejectReason::InvalidQuantity);
+            return Err(RejectReason::InvalidQuantity);
         }
         if self.used_order_ids.contains(&request.order_id) {
-            return SubmitResult::rejected(RejectReason::DuplicateOrderId);
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        if self.next_sequence == Sequence::MAX {
+            return Err(RejectReason::SequenceExhausted);
+        }
+        if options.post_only && options.time_in_force != TimeInForce::Gtc {
+            return Err(RejectReason::InvalidOrderOptions);
+        }
+        if options.post_only && self.would_cross(request.side, request.price_ticks) {
+            return Err(RejectReason::PostOnlyWouldTake);
+        }
+        if options.time_in_force == TimeInForce::Fok
+            && self.available_crossing_quantity(request.side, request.price_ticks)
+                < u128::from(request.quantity_lots)
+        {
+            return Err(RejectReason::FillOrKillUnavailable);
+        }
+        Ok(())
+    }
+
+    /// Apply GTC, IOC or FOK matching while preserving price-time priority.
+    pub fn submit_with_options(
+        &mut self,
+        request: OrderRequest,
+        options: OrderOptions,
+    ) -> SubmitResult {
+        if let Err(reason) = self.preflight(request, options) {
+            return SubmitResult::rejected(reason);
         }
         let Some(sequence) = self.allocate_sequence() else {
             return SubmitResult::rejected(RejectReason::SequenceExhausted);
@@ -157,8 +222,6 @@ impl MatchingEngine {
                     .filter(|price| *price >= request.price_ticks),
             };
             let Some(price) = best_price else { break };
-            // Borrow the selected side's level map and the live index as
-            // disjoint fields so completed makers can leave the index here.
             let resting_side = match request.side {
                 Side::Buy => Side::Sell,
                 Side::Sell => Side::Buy,
@@ -197,21 +260,55 @@ impl MatchingEngine {
             }
         }
 
-        if remaining > 0 {
-            let order = RestingOrder {
-                order_id: request.order_id,
-                side: request.side,
-                price_ticks: request.price_ticks,
-                remaining_lots: remaining,
-                sequence,
-            };
-            self.insert_live_order(order);
-        }
+        let resting_quantity_lots = if options.time_in_force == TimeInForce::Gtc {
+            if remaining > 0 {
+                self.insert_live_order(RestingOrder {
+                    order_id: request.order_id,
+                    side: request.side,
+                    price_ticks: request.price_ticks,
+                    remaining_lots: remaining,
+                    sequence,
+                });
+            }
+            remaining
+        } else {
+            0
+        };
         SubmitResult {
             sequence: Some(sequence),
             trades,
-            resting_quantity_lots: remaining,
+            resting_quantity_lots,
             rejection: None,
+        }
+    }
+
+    fn would_cross(&self, side: Side, price_ticks: PriceTicks) -> bool {
+        match side {
+            Side::Buy => self
+                .asks
+                .keys()
+                .next()
+                .is_some_and(|ask| *ask <= price_ticks),
+            Side::Sell => self
+                .bids
+                .keys()
+                .next_back()
+                .is_some_and(|bid| *bid >= price_ticks),
+        }
+    }
+
+    fn available_crossing_quantity(&self, side: Side, price_ticks: PriceTicks) -> u128 {
+        match side {
+            Side::Buy => self
+                .asks
+                .range(..=price_ticks)
+                .map(|(_, level)| level.total_quantity)
+                .fold(0_u128, u128::saturating_add),
+            Side::Sell => self
+                .bids
+                .range(price_ticks..)
+                .map(|(_, level)| level.total_quantity)
+                .fold(0_u128, u128::saturating_add),
         }
     }
 
@@ -556,6 +653,107 @@ mod tests {
         assert_eq!(engine.best_bid(), Some((101, 1)));
         assert_eq!(engine.best_ask(), None);
         assert!(engine.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn ioc_fills_available_quantity_without_resting_remainder() {
+        let mut engine = MatchingEngine::new();
+        engine.submit(order(1, Side::Sell, 100, 5));
+        let result = engine.submit_with_options(
+            order(2, Side::Buy, 100, 7),
+            OrderOptions {
+                time_in_force: TimeInForce::Ioc,
+                post_only: false,
+            },
+        );
+        assert_eq!(result.rejection, None);
+        assert_eq!(result.resting_quantity_lots, 0);
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.trades[0].quantity_lots, 5);
+        assert_eq!(engine.best_ask(), None);
+        assert_eq!(engine.best_bid(), None);
+        assert_eq!(engine.live_order_count(), 0);
+        assert!(engine.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn fok_insufficient_depth_rejects_without_mutating_any_state() {
+        let mut engine = MatchingEngine::new();
+        engine.submit(order(1, Side::Sell, 100, 2));
+        let before = engine.state_fingerprint();
+        let result = engine.submit_with_options(
+            order(2, Side::Buy, 100, 3),
+            OrderOptions {
+                time_in_force: TimeInForce::Fok,
+                post_only: false,
+            },
+        );
+        assert_eq!(result.rejection, Some(RejectReason::FillOrKillUnavailable));
+        assert_eq!(result.sequence, None);
+        assert_eq!(engine.state_fingerprint(), before);
+        assert!(engine.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn fok_consumes_multiple_levels_only_when_all_quantity_is_available() {
+        let mut engine = MatchingEngine::new();
+        engine.submit(order(1, Side::Sell, 100, 1));
+        engine.submit(order(2, Side::Sell, 101, 2));
+        let result = engine.submit_with_options(
+            order(3, Side::Buy, 101, 3),
+            OrderOptions {
+                time_in_force: TimeInForce::Fok,
+                post_only: false,
+            },
+        );
+        assert_eq!(result.rejection, None);
+        assert_eq!(result.resting_quantity_lots, 0);
+        assert_eq!(
+            result
+                .trades
+                .iter()
+                .map(|trade| (trade.maker_order_id, trade.price_ticks, trade.quantity_lots))
+                .collect::<Vec<_>>(),
+            vec![(1, 100, 1), (2, 101, 2)]
+        );
+        assert_eq!(engine.live_order_count(), 0);
+        assert!(engine.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn post_only_crossing_order_rejects_without_advancing_sequence() {
+        let mut engine = MatchingEngine::new();
+        engine.submit(order(1, Side::Sell, 100, 2));
+        let before = engine.state_fingerprint();
+        let result = engine.submit_with_options(
+            order(2, Side::Buy, 100, 1),
+            OrderOptions {
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+            },
+        );
+        assert_eq!(result.rejection, Some(RejectReason::PostOnlyWouldTake));
+        assert_eq!(result.sequence, None);
+        assert_eq!(engine.state_fingerprint(), before);
+        assert!(engine.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn post_only_rejects_conflicting_ioc_fok_flags() {
+        let mut engine = MatchingEngine::new();
+        let result = engine.submit_with_options(
+            order(1, Side::Buy, 100, 1),
+            OrderOptions {
+                time_in_force: TimeInForce::Ioc,
+                post_only: true,
+            },
+        );
+        assert_eq!(result.rejection, Some(RejectReason::InvalidOrderOptions));
+        assert_eq!(engine.live_order_count(), 0);
+        assert_eq!(
+            engine.state_fingerprint(),
+            MatchingEngine::new().state_fingerprint()
+        );
     }
 
     #[test]
