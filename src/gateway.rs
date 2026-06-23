@@ -5,7 +5,7 @@
 //! lifetime. Replace requests cancel the old order and submit a fresh order,
 //! so they do not inherit time priority.
 
-use crate::{MatchingEngine, OrderRequest, RejectReason, Side, Trade};
+use crate::{MatchingEngine, OrderOptions, OrderRequest, RejectReason, Side, TimeInForce, Trade};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
@@ -28,6 +28,8 @@ pub struct OrderStateSnapshot {
     pub cumulative_quantity_lots: u64,
     pub leaves_quantity_lots: u64,
     pub status: OrderStatus,
+    pub time_in_force: TimeInForce,
+    pub post_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,10 @@ pub enum GatewayCommand {
         side: Side,
         price_ticks: i64,
         quantity_lots: u64,
+        #[serde(default)]
+        time_in_force: TimeInForce,
+        #[serde(default)]
+        post_only: bool,
     },
     Cancel {
         client_order_id: u64,
@@ -71,6 +77,10 @@ pub enum GatewayCommand {
         replacement_client_order_id: u64,
         price_ticks: i64,
         quantity_lots: u64,
+        #[serde(default)]
+        time_in_force: TimeInForce,
+        #[serde(default)]
+        post_only: bool,
     },
 }
 
@@ -175,6 +185,8 @@ struct OrderRecord {
     order_quantity_lots: u64,
     cumulative_quantity_lots: u64,
     status: OrderStatus,
+    time_in_force: TimeInForce,
+    post_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +253,8 @@ impl SimulatedExchange {
                 side,
                 price_ticks,
                 quantity_lots,
+                time_in_force,
+                post_only,
             } => self.submit_new(
                 request.client_id,
                 request.request_id,
@@ -249,6 +263,10 @@ impl SimulatedExchange {
                 side,
                 price_ticks,
                 quantity_lots,
+                OrderOptions {
+                    time_in_force,
+                    post_only,
+                },
             )?,
             GatewayCommand::Cancel { client_order_id } => {
                 self.cancel(request.client_id, request.request_id, client_order_id)
@@ -258,6 +276,8 @@ impl SimulatedExchange {
                 replacement_client_order_id,
                 price_ticks,
                 quantity_lots,
+                time_in_force,
+                post_only,
             } => self.replace(
                 request.client_id,
                 request.request_id,
@@ -265,6 +285,10 @@ impl SimulatedExchange {
                 replacement_client_order_id,
                 price_ticks,
                 quantity_lots,
+                OrderOptions {
+                    time_in_force,
+                    post_only,
+                },
             )?,
         };
         self.request_cache.insert(
@@ -319,8 +343,17 @@ impl SimulatedExchange {
                 price_ticks: record.price_ticks,
                 order_quantity_lots: record.order_quantity_lots,
                 cumulative_quantity_lots: record.cumulative_quantity_lots,
-                leaves_quantity_lots: record.order_quantity_lots - record.cumulative_quantity_lots,
+                leaves_quantity_lots: if matches!(
+                    record.status,
+                    OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+                ) {
+                    0
+                } else {
+                    record.order_quantity_lots - record.cumulative_quantity_lots
+                },
                 status: record.status,
+                time_in_force: record.time_in_force,
+                post_only: record.post_only,
             })
             .collect();
         states.sort_by_key(|state| (state.client_id, state.client_order_id));
@@ -438,6 +471,13 @@ impl SimulatedExchange {
             add(&mut hash, &record.price_ticks.to_le_bytes());
             add(&mut hash, &record.order_quantity_lots.to_le_bytes());
             add(&mut hash, &record.cumulative_quantity_lots.to_le_bytes());
+            add(
+                &mut hash,
+                &[
+                    time_in_force_code(record.time_in_force),
+                    u8::from(record.post_only),
+                ],
+            );
         }
         let mut used_keys: Vec<_> = self.used_client_order_ids.iter().copied().collect();
         used_keys.sort_unstable();
@@ -471,6 +511,7 @@ impl SimulatedExchange {
         side: Side,
         price_ticks: i64,
         quantity_lots: u64,
+        options: OrderOptions,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
         let key = ClientOrderKey {
             client_id,
@@ -524,17 +565,46 @@ impl SimulatedExchange {
                 reason,
             )]);
         }
+        let candidate_id = self
+            .next_exchange_order_id
+            .checked_add(1)
+            .ok_or(GatewayError::ExchangeOrderIdExhausted)?;
+        let request = OrderRequest {
+            order_id: candidate_id,
+            side,
+            price_ticks,
+            quantity_lots,
+        };
+        let engine = self.engines.entry(symbol.clone()).or_default();
+        // Policy rejections must not consume an exchange ID or engine sequence.
+        let request = OrderRequest {
+            order_id: candidate_id,
+            ..request
+        };
+        if let Err(reason) = engine.preflight(request, options) {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                None,
+                Some(side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::Engine(reason),
+            )]);
+        }
         let exchange_order_id = self.allocate_exchange_order_id()?;
         let result = self
             .engines
-            .entry(symbol.clone())
-            .or_default()
-            .submit(OrderRequest {
-                order_id: exchange_order_id,
-                side,
-                price_ticks,
-                quantity_lots,
-            });
+            .get_mut(&symbol)
+            .expect("engine inserted above")
+            .submit_with_options(
+                OrderRequest {
+                    order_id: exchange_order_id,
+                    ..request
+                },
+                options,
+            );
         if let Some(reason) = result.rejection {
             return Ok(vec![self.reject(
                 client_id,
@@ -559,6 +629,8 @@ impl SimulatedExchange {
                 order_quantity_lots: quantity_lots,
                 cumulative_quantity_lots: 0,
                 status: OrderStatus::Accepted,
+                time_in_force: options.time_in_force,
+                post_only: options.post_only,
             },
         );
         self.reports_for_submit(
@@ -572,6 +644,7 @@ impl SimulatedExchange {
             result.trades,
             result.resting_quantity_lots,
             result.sequence,
+            options.time_in_force,
         )
     }
 
@@ -629,13 +702,14 @@ impl SimulatedExchange {
             Some(record.price_ticks),
             record.order_quantity_lots,
             record.cumulative_quantity_lots,
-            cancelled.remaining_lots,
+            0,
             0,
             None,
             None,
         )]
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replace(
         &mut self,
         client_id: u64,
@@ -644,6 +718,7 @@ impl SimulatedExchange {
         replacement_client_order_id: u64,
         price_ticks: i64,
         quantity_lots: u64,
+        options: OrderOptions,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
         let old_key = ClientOrderKey {
             client_id,
@@ -715,12 +790,38 @@ impl SimulatedExchange {
                 reason,
             )]);
         }
+        let candidate_id = self
+            .next_exchange_order_id
+            .checked_add(1)
+            .ok_or(GatewayError::ExchangeOrderIdExhausted)?;
+        let replacement = OrderRequest {
+            order_id: candidate_id,
+            side: old_record.side,
+            price_ticks,
+            quantity_lots,
+        };
+        if let Err(reason) = self.engines[&old_record.symbol].preflight_replace(
+            old_record.exchange_order_id,
+            replacement,
+            options,
+        ) {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                replacement_client_order_id,
+                None,
+                Some(old_record.side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::Engine(reason),
+            )]);
+        }
         let exchange_order_id = self.allocate_exchange_order_id()?;
         let replaced = self
             .engines
             .get_mut(&old_record.symbol)
             .expect("order symbol has a matching engine")
-            .replace(
+            .replace_with_options(
                 old_record.exchange_order_id,
                 OrderRequest {
                     order_id: exchange_order_id,
@@ -728,6 +829,7 @@ impl SimulatedExchange {
                     price_ticks,
                     quantity_lots,
                 },
+                options,
             );
         if let Some(reason) = replaced.rejection {
             return Ok(vec![self.reject(
@@ -758,7 +860,7 @@ impl SimulatedExchange {
             Some(old_record.price_ticks),
             old_record.order_quantity_lots,
             old_record.cumulative_quantity_lots,
-            old_record.order_quantity_lots - old_record.cumulative_quantity_lots,
+            0,
             0,
             None,
             None,
@@ -779,6 +881,8 @@ impl SimulatedExchange {
                 order_quantity_lots: quantity_lots,
                 cumulative_quantity_lots: 0,
                 status: OrderStatus::Accepted,
+                time_in_force: options.time_in_force,
+                post_only: options.post_only,
             },
         );
         reports.extend(self.reports_for_submit(
@@ -792,6 +896,7 @@ impl SimulatedExchange {
             replaced.replacement.trades,
             replaced.replacement.resting_quantity_lots,
             replaced.replacement.sequence,
+            options.time_in_force,
         )?);
         Ok(reports)
     }
@@ -809,6 +914,7 @@ impl SimulatedExchange {
         trades: Vec<Trade>,
         resting_quantity: u64,
         engine_sequence: Option<u64>,
+        time_in_force: TimeInForce,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
         let mut reports = Vec::with_capacity(trades.len().saturating_mul(2).max(1));
         let had_trades = !trades.is_empty();
@@ -898,6 +1004,29 @@ impl SimulatedExchange {
         }
         if resting_quantity > 0 {
             self.live_orders.insert(taker_exchange_id, taker_key);
+        }
+        if time_in_force == TimeInForce::Ioc {
+            let mut taker = self.orders[&taker_key].clone();
+            if taker.cumulative_quantity_lots < taker.order_quantity_lots {
+                taker.status = OrderStatus::Cancelled;
+                self.orders.insert(taker_key, taker.clone());
+                reports.push(self.report(
+                    client_id,
+                    request_id,
+                    taker_key.client_order_id,
+                    Some(taker_exchange_id),
+                    engine_sequence,
+                    OrderStatus::Cancelled,
+                    Some(taker.side),
+                    Some(taker.price_ticks),
+                    taker.order_quantity_lots,
+                    taker.cumulative_quantity_lots,
+                    0,
+                    0,
+                    None,
+                    None,
+                ));
+            }
         }
         Ok(reports)
     }
@@ -1068,6 +1197,14 @@ fn status_code(status: OrderStatus) -> u8 {
     }
 }
 
+fn time_in_force_code(time_in_force: TimeInForce) -> u8 {
+    match time_in_force {
+        TimeInForce::Gtc => 0,
+        TimeInForce::Ioc => 1,
+        TimeInForce::Fok => 2,
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JsonlSummary {
     pub requests: u64,
@@ -1143,7 +1280,134 @@ mod tests {
             side,
             price_ticks: price,
             quantity_lots: quantity,
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
         }
+    }
+
+    fn new_order_with_options(
+        id: u64,
+        side: Side,
+        price: i64,
+        quantity: u64,
+        time_in_force: TimeInForce,
+        post_only: bool,
+    ) -> GatewayCommand {
+        GatewayCommand::New {
+            client_order_id: id,
+            symbol: "DEFAULT".into(),
+            side,
+            price_ticks: price,
+            quantity_lots: quantity,
+            time_in_force,
+            post_only,
+        }
+    }
+
+    #[test]
+    fn ioc_reports_fills_then_cancels_unfilled_quantity_without_resting() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Sell, 100, 3)))
+            .unwrap();
+        let response = exchange
+            .handle(request(
+                2,
+                1,
+                new_order_with_options(2, Side::Buy, 100, 5, TimeInForce::Ioc, false),
+            ))
+            .unwrap();
+
+        assert_eq!(response.reports.len(), 3);
+        assert_eq!(response.reports[1].status, OrderStatus::PartiallyFilled);
+        assert_eq!(response.reports[1].cumulative_quantity_lots, 3);
+        assert_eq!(response.reports[1].leaves_quantity_lots, 2);
+        assert_eq!(response.reports[2].status, OrderStatus::Cancelled);
+        assert_eq!(response.reports[2].cumulative_quantity_lots, 3);
+        assert_eq!(response.reports[2].leaves_quantity_lots, 0);
+        let taker = exchange
+            .order_states()
+            .into_iter()
+            .find(|order| order.client_id == 2)
+            .unwrap();
+        assert_eq!(taker.status, OrderStatus::Cancelled);
+        assert_eq!(taker.leaves_quantity_lots, 0);
+        assert_eq!(exchange.live_order_count(), 0);
+        exchange.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn policy_rejections_preserve_order_and_exchange_id_sequences() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Sell, 100, 2)))
+            .unwrap();
+        let before = exchange.book_orders();
+        let fok = exchange
+            .handle(request(
+                2,
+                1,
+                new_order_with_options(2, Side::Buy, 100, 3, TimeInForce::Fok, false),
+            ))
+            .unwrap();
+        assert_eq!(
+            fok.reports[0].reject_reason,
+            Some(GatewayRejectReason::Engine(
+                RejectReason::FillOrKillUnavailable
+            ))
+        );
+        let post_only = exchange
+            .handle(request(
+                3,
+                1,
+                new_order_with_options(3, Side::Buy, 100, 1, TimeInForce::Gtc, true),
+            ))
+            .unwrap();
+        assert_eq!(
+            post_only.reports[0].reject_reason,
+            Some(GatewayRejectReason::Engine(RejectReason::PostOnlyWouldTake))
+        );
+        assert_eq!(exchange.book_orders(), before);
+        let accepted = exchange
+            .handle(request(4, 1, new_order(4, Side::Buy, 99, 1)))
+            .unwrap();
+        assert_eq!(accepted.reports[0].exchange_order_id, Some(2));
+        exchange.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn rejected_fok_replacement_keeps_old_order_live() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 90, 2)))
+            .unwrap();
+        exchange
+            .handle(request(2, 1, new_order(2, Side::Sell, 100, 1)))
+            .unwrap();
+        let response = exchange
+            .handle(request(
+                1,
+                2,
+                GatewayCommand::Replace {
+                    client_order_id: 1,
+                    replacement_client_order_id: 3,
+                    price_ticks: 100,
+                    quantity_lots: 2,
+                    time_in_force: TimeInForce::Fok,
+                    post_only: false,
+                },
+            ))
+            .unwrap();
+        assert_eq!(response.reports.len(), 1);
+        assert_eq!(
+            response.reports[0].reject_reason,
+            Some(GatewayRejectReason::Engine(
+                RejectReason::FillOrKillUnavailable
+            ))
+        );
+        assert_eq!(exchange.best_bid(), Some((90, 2)));
+        assert_eq!(exchange.live_order_count(), 2);
+        exchange.check_invariants().unwrap();
     }
 
     #[test]
@@ -1175,7 +1439,7 @@ mod tests {
             .unwrap();
         assert_eq!(cancel.reports[0].status, OrderStatus::Cancelled);
         assert_eq!(cancel.reports[0].cumulative_quantity_lots, 3);
-        assert_eq!(cancel.reports[0].leaves_quantity_lots, 2);
+        assert_eq!(cancel.reports[0].leaves_quantity_lots, 0);
         assert_eq!(exchange.live_order_count(), 0);
         assert!(exchange.check_invariants().is_ok());
     }
@@ -1215,6 +1479,8 @@ mod tests {
                     replacement_client_order_id: 2,
                     price_ticks: 100,
                     quantity_lots: 2,
+                    time_in_force: TimeInForce::Gtc,
+                    post_only: false,
                 },
             ))
             .unwrap();
@@ -1279,6 +1545,8 @@ mod tests {
                     replacement_client_order_id: 2,
                     price_ticks: 101,
                     quantity_lots: 5,
+                    time_in_force: TimeInForce::Gtc,
+                    post_only: false,
                 },
             ))
             .unwrap();
@@ -1342,6 +1610,8 @@ mod tests {
                         replacement_client_order_id: index,
                         price_ticks: 98 + ((random >> 4) % 5) as i64,
                         quantity_lots: 1 + ((random >> 9) % 8),
+                        time_in_force: TimeInForce::Gtc,
+                        post_only: false,
                     }
                 }
                 _ => new_order(index, Side::Buy, 100, 1),
@@ -1381,6 +1651,27 @@ mod tests {
         assert_eq!(one.requests, 3);
         assert_eq!(one.reports, 4);
         assert_eq!(one.rejections, 0);
+    }
+
+    #[test]
+    fn jsonl_requests_support_ioc_and_default_legacy_fields() {
+        let input = concat!(
+            "{\"client_id\":1,\"request_id\":1,\"command\":{\"type\":\"new\",\"client_order_id\":1,\"side\":\"sell\",\"price_ticks\":100,\"quantity_lots\":2}}\n",
+            "{\"client_id\":2,\"request_id\":1,\"command\":{\"type\":\"new\",\"client_order_id\":2,\"side\":\"buy\",\"price_ticks\":100,\"quantity_lots\":3,\"time_in_force\":\"ioc\"}}\n"
+        );
+        let mut output = Vec::new();
+        let summary = run_jsonl(input.as_bytes(), &mut output, GatewayConfig::default()).unwrap();
+        let responses: Vec<GatewayResponse> = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+
+        assert_eq!(summary.requests, 2);
+        assert_eq!(responses[0].reports[0].status, OrderStatus::Accepted);
+        assert_eq!(responses[1].reports.len(), 3);
+        assert_eq!(responses[1].reports[2].status, OrderStatus::Cancelled);
+        assert_eq!(responses[1].reports[2].leaves_quantity_lots, 0);
     }
 
     #[test]
@@ -1529,6 +1820,8 @@ mod tests {
                     replacement_client_order_id: 56,
                     price_ticks: 99,
                     quantity_lots: 3,
+                    time_in_force: TimeInForce::Gtc,
+                    post_only: false,
                 },
             ))
             .unwrap();

@@ -45,6 +45,8 @@ pub fn frozen_workload(commands: usize, seed: u64) -> Vec<u8> {
                 },
                 price_ticks: price,
                 quantity_lots: 1 + (noise % 5),
+                time_in_force: crate::TimeInForce::Gtc,
+                post_only: false,
             },
         };
         serde_json::to_writer(&mut out, &request).expect("request serialization");

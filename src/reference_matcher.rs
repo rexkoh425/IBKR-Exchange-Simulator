@@ -9,7 +9,8 @@ use crate::gateway::{
     GatewayRequest, GatewayResponse, OrderStateSnapshot, OrderStatus,
 };
 use crate::{
-    OrderRequest, RejectReason, ReplaceResult, RestingOrder, Sequence, Side, SubmitResult, Trade,
+    OrderOptions, OrderRequest, RejectReason, ReplaceResult, RestingOrder, Sequence, Side,
+    SubmitResult, TimeInForce, Trade,
 };
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -17,7 +18,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ReferenceMatcher {
     resting: Vec<RestingOrder>,
     used_order_ids: HashSet<u64>,
@@ -25,19 +26,71 @@ struct ReferenceMatcher {
 }
 
 impl ReferenceMatcher {
-    fn submit(&mut self, request: OrderRequest) -> SubmitResult {
+    fn preflight_order(
+        &self,
+        request: OrderRequest,
+        options: OrderOptions,
+    ) -> Result<(), RejectReason> {
         if request.price_ticks <= 0 {
-            return rejected(RejectReason::InvalidPrice);
+            return Err(RejectReason::InvalidPrice);
         }
         if request.quantity_lots == 0 {
-            return rejected(RejectReason::InvalidQuantity);
+            return Err(RejectReason::InvalidQuantity);
         }
         if self.used_order_ids.contains(&request.order_id) {
-            return rejected(RejectReason::DuplicateOrderId);
+            return Err(RejectReason::DuplicateOrderId);
         }
-        let Some(sequence) = self.next_sequence.checked_add(1) else {
-            return rejected(RejectReason::SequenceExhausted);
+        if self.next_sequence == Sequence::MAX {
+            return Err(RejectReason::SequenceExhausted);
+        }
+        if options.post_only && options.time_in_force != TimeInForce::Gtc {
+            return Err(RejectReason::InvalidOrderOptions);
+        }
+        let eligible = |order: &&RestingOrder| match request.side {
+            Side::Buy => order.side == Side::Sell && order.price_ticks <= request.price_ticks,
+            Side::Sell => order.side == Side::Buy && order.price_ticks >= request.price_ticks,
         };
+        if options.post_only && self.resting.iter().find(eligible).is_some() {
+            return Err(RejectReason::PostOnlyWouldTake);
+        }
+        let available = self
+            .resting
+            .iter()
+            .filter(eligible)
+            .map(|order| u128::from(order.remaining_lots))
+            .fold(0_u128, u128::saturating_add);
+        if options.time_in_force == TimeInForce::Fok
+            && available < u128::from(request.quantity_lots)
+        {
+            return Err(RejectReason::FillOrKillUnavailable);
+        }
+        Ok(())
+    }
+
+    fn preflight_replace(
+        &self,
+        old_id: u64,
+        replacement: OrderRequest,
+        options: OrderOptions,
+    ) -> Result<(), RejectReason> {
+        if !self.resting.iter().any(|order| order.order_id == old_id) {
+            return Err(RejectReason::UnknownOrderId);
+        }
+        if self.next_sequence >= Sequence::MAX - 1 {
+            return Err(RejectReason::SequenceExhausted);
+        }
+        self.preflight_order(replacement, options)
+    }
+
+    fn submit_with_options(
+        &mut self,
+        request: OrderRequest,
+        options: OrderOptions,
+    ) -> SubmitResult {
+        if let Err(reason) = self.preflight_order(request, options) {
+            return rejected(reason);
+        }
+        let sequence = self.next_sequence + 1;
         self.next_sequence = sequence;
         self.used_order_ids.insert(request.order_id);
 
@@ -85,7 +138,7 @@ impl ReferenceMatcher {
                 self.resting[index].remaining_lots -= quantity;
             }
         }
-        if remaining > 0 {
+        if remaining > 0 && options.time_in_force == TimeInForce::Gtc {
             self.resting.push(RestingOrder {
                 order_id: request.order_id,
                 side: request.side,
@@ -97,7 +150,11 @@ impl ReferenceMatcher {
         SubmitResult {
             sequence: Some(sequence),
             trades,
-            resting_quantity_lots: remaining,
+            resting_quantity_lots: if options.time_in_force == TimeInForce::Gtc {
+                remaining
+            } else {
+                0
+            },
             rejection: None,
         }
     }
@@ -117,7 +174,12 @@ impl ReferenceMatcher {
         Ok(self.resting.remove(index))
     }
 
-    fn replace(&mut self, old_id: u64, replacement: OrderRequest) -> ReplaceResult {
+    fn replace_with_options(
+        &mut self,
+        old_id: u64,
+        replacement: OrderRequest,
+        options: OrderOptions,
+    ) -> ReplaceResult {
         let rejection = if replacement.price_ticks <= 0 {
             Some(RejectReason::InvalidPrice)
         } else if replacement.quantity_lots == 0 {
@@ -128,6 +190,36 @@ impl ReferenceMatcher {
             Some(RejectReason::UnknownOrderId)
         } else if self.next_sequence >= Sequence::MAX - 1 {
             Some(RejectReason::SequenceExhausted)
+        } else if options.post_only && options.time_in_force != TimeInForce::Gtc {
+            Some(RejectReason::InvalidOrderOptions)
+        } else if options.post_only
+            && self.resting.iter().any(|order| match replacement.side {
+                Side::Buy => {
+                    order.side == Side::Sell && order.price_ticks <= replacement.price_ticks
+                }
+                Side::Sell => {
+                    order.side == Side::Buy && order.price_ticks >= replacement.price_ticks
+                }
+            })
+        {
+            Some(RejectReason::PostOnlyWouldTake)
+        } else if options.time_in_force == TimeInForce::Fok
+            && self
+                .resting
+                .iter()
+                .filter(|order| match replacement.side {
+                    Side::Buy => {
+                        order.side == Side::Sell && order.price_ticks <= replacement.price_ticks
+                    }
+                    Side::Sell => {
+                        order.side == Side::Buy && order.price_ticks >= replacement.price_ticks
+                    }
+                })
+                .map(|order| u128::from(order.remaining_lots))
+                .sum::<u128>()
+                < u128::from(replacement.quantity_lots)
+        {
+            Some(RejectReason::FillOrKillUnavailable)
         } else {
             None
         };
@@ -141,7 +233,7 @@ impl ReferenceMatcher {
         self.cancel(old_id)
             .expect("replacement prevalidated old order");
         let cancelled_sequence = Some(self.next_sequence);
-        let result = self.submit(replacement);
+        let result = self.submit_with_options(replacement, options);
         ReplaceResult {
             cancelled_sequence,
             replacement: result,
@@ -247,6 +339,8 @@ struct ReferenceOrder {
     quantity_lots: u64,
     cumulative_lots: u64,
     status: OrderStatus,
+    time_in_force: TimeInForce,
+    post_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +398,8 @@ impl ReferenceExchange {
                 side,
                 price_ticks,
                 quantity_lots,
+                time_in_force,
+                post_only,
             } => self.submit_new(
                 request.client_id,
                 request.request_id,
@@ -312,6 +408,10 @@ impl ReferenceExchange {
                 side,
                 price_ticks,
                 quantity_lots,
+                OrderOptions {
+                    time_in_force,
+                    post_only,
+                },
             ),
             GatewayCommand::Cancel { client_order_id } => {
                 Ok(self.cancel(request.client_id, request.request_id, client_order_id))
@@ -321,6 +421,8 @@ impl ReferenceExchange {
                 replacement_client_order_id,
                 price_ticks,
                 quantity_lots,
+                time_in_force,
+                post_only,
             } => self.replace(
                 request.client_id,
                 request.request_id,
@@ -328,6 +430,10 @@ impl ReferenceExchange {
                 replacement_client_order_id,
                 price_ticks,
                 quantity_lots,
+                OrderOptions {
+                    time_in_force,
+                    post_only,
+                },
             ),
         }?;
         self.cache.insert(
@@ -355,6 +461,7 @@ impl ReferenceExchange {
         side: Side,
         price_ticks: i64,
         quantity_lots: u64,
+        options: OrderOptions,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
         let key = ReferenceKey {
             client_id,
@@ -413,17 +520,36 @@ impl ReferenceExchange {
                 reason,
             )]);
         }
+        let exchange_id = self
+            .next_exchange_id
+            .checked_add(1)
+            .ok_or(GatewayError::ExchangeOrderIdExhausted)?;
+        let order_request = OrderRequest {
+            order_id: exchange_id,
+            side,
+            price_ticks,
+            quantity_lots,
+        };
+        let matcher = self.engines.entry(symbol.clone()).or_default();
+        if let Err(reason) = matcher.preflight_order(order_request, options) {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                None,
+                None,
+                Some(side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::Engine(reason),
+            )]);
+        }
         let exchange_id = self.alloc_exchange_id()?;
         let result = self
             .engines
-            .entry(symbol.clone())
-            .or_default()
-            .submit(OrderRequest {
-                order_id: exchange_id,
-                side,
-                price_ticks,
-                quantity_lots,
-            });
+            .get_mut(&symbol)
+            .expect("matcher inserted above")
+            .submit_with_options(order_request, options);
         if let Some(reason) = result.rejection {
             return Ok(vec![self.reject(
                 client_id,
@@ -450,6 +576,8 @@ impl ReferenceExchange {
                 quantity_lots,
                 cumulative_lots: 0,
                 status: OrderStatus::Accepted,
+                time_in_force: options.time_in_force,
+                post_only: options.post_only,
             },
         );
         self.reports_for_submit(
@@ -463,6 +591,7 @@ impl ReferenceExchange {
             result.trades,
             result.resting_quantity_lots,
             Some(sequence),
+            options.time_in_force,
         )
     }
 
@@ -522,13 +651,14 @@ impl ReferenceExchange {
             Some(order.price_ticks),
             order.quantity_lots,
             order.cumulative_lots,
-            cancelled.remaining_lots,
+            0,
             0,
             None,
             None,
         )]
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replace(
         &mut self,
         client_id: u64,
@@ -537,6 +667,7 @@ impl ReferenceExchange {
         replacement_client_order_id: u64,
         price_ticks: i64,
         quantity_lots: u64,
+        options: OrderOptions,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
         let old_key = ReferenceKey {
             client_id,
@@ -615,12 +746,39 @@ impl ReferenceExchange {
                 reason,
             )]);
         }
+        let exchange_id = self
+            .next_exchange_id
+            .checked_add(1)
+            .ok_or(GatewayError::ExchangeOrderIdExhausted)?;
+        let replacement_request = OrderRequest {
+            order_id: exchange_id,
+            side: old.side,
+            price_ticks,
+            quantity_lots,
+        };
+        if let Err(reason) = self.engines[&old.symbol].preflight_replace(
+            old.exchange_order_id,
+            replacement_request,
+            options,
+        ) {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                replacement_client_order_id,
+                None,
+                None,
+                Some(old.side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::Engine(reason),
+            )]);
+        }
         let exchange_id = self.alloc_exchange_id()?;
         let replaced = self
             .engines
             .get_mut(&old.symbol)
             .expect("symbol has matcher")
-            .replace(
+            .replace_with_options(
                 old.exchange_order_id,
                 OrderRequest {
                     order_id: exchange_id,
@@ -628,6 +786,7 @@ impl ReferenceExchange {
                     price_ticks,
                     quantity_lots,
                 },
+                options,
             );
         if let Some(reason) = replaced.rejection {
             return Ok(vec![self.reject(
@@ -658,7 +817,7 @@ impl ReferenceExchange {
             Some(old.price_ticks),
             old.quantity_lots,
             old.cumulative_lots,
-            old.quantity_lots - old.cumulative_lots,
+            0,
             0,
             None,
             None,
@@ -679,6 +838,8 @@ impl ReferenceExchange {
                 quantity_lots,
                 cumulative_lots: 0,
                 status: OrderStatus::Accepted,
+                time_in_force: options.time_in_force,
+                post_only: options.post_only,
             },
         );
         reports.extend(self.reports_for_submit(
@@ -692,6 +853,7 @@ impl ReferenceExchange {
             replaced.replacement.trades,
             replaced.replacement.resting_quantity_lots,
             Some(sequence),
+            options.time_in_force,
         )?);
         Ok(reports)
     }
@@ -709,6 +871,7 @@ impl ReferenceExchange {
         trades: Vec<Trade>,
         resting_quantity: u64,
         engine_sequence: Option<u64>,
+        time_in_force: TimeInForce,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
         let had_trades = !trades.is_empty();
         let mut reports = Vec::with_capacity(trades.len().saturating_mul(2).max(1));
@@ -789,6 +952,29 @@ impl ReferenceExchange {
         }
         if resting_quantity > 0 {
             self.live.insert(taker_exchange_id, taker_key);
+        }
+        if time_in_force == TimeInForce::Ioc {
+            let mut taker = self.orders[&taker_key].clone();
+            if taker.cumulative_lots < taker.quantity_lots {
+                taker.status = OrderStatus::Cancelled;
+                self.orders.insert(taker_key, taker.clone());
+                reports.push(self.report(
+                    client_id,
+                    request_id,
+                    taker_key.client_order_id,
+                    Some(taker_exchange_id),
+                    engine_sequence,
+                    OrderStatus::Cancelled,
+                    Some(taker.side),
+                    Some(taker.price_ticks),
+                    taker.quantity_lots,
+                    taker.cumulative_lots,
+                    0,
+                    0,
+                    None,
+                    None,
+                ));
+            }
         }
         Ok(reports)
     }
@@ -910,8 +1096,17 @@ impl ReferenceExchange {
                 price_ticks: order.price_ticks,
                 order_quantity_lots: order.quantity_lots,
                 cumulative_quantity_lots: order.cumulative_lots,
-                leaves_quantity_lots: order.quantity_lots - order.cumulative_lots,
+                leaves_quantity_lots: if matches!(
+                    order.status,
+                    OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+                ) {
+                    0
+                } else {
+                    order.quantity_lots - order.cumulative_lots
+                },
                 status: order.status,
+                time_in_force: order.time_in_force,
+                post_only: order.post_only,
             })
             .collect();
         states.sort_by_key(|order| (order.client_id, order.client_order_id));
@@ -977,6 +1172,17 @@ impl ReferenceExchange {
             add(&mut hash, &order.price_ticks.to_le_bytes());
             add(&mut hash, &order.quantity_lots.to_le_bytes());
             add(&mut hash, &order.cumulative_lots.to_le_bytes());
+            add(
+                &mut hash,
+                &[
+                    match order.time_in_force {
+                        TimeInForce::Gtc => 0,
+                        TimeInForce::Ioc => 1,
+                        TimeInForce::Fok => 2,
+                    },
+                    u8::from(order.post_only),
+                ],
+            );
         }
         let mut used: Vec<_> = self.used_client_ids.iter().copied().collect();
         used.sort_unstable();
@@ -1054,12 +1260,15 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
                     side,
                     price_ticks,
                     quantity_lots,
+                    ..
                 } => GatewayCommand::New {
                     client_order_id: client_order_id ^ (1 << 63),
                     symbol,
                     side,
                     price_ticks,
                     quantity_lots: quantity_lots.wrapping_add(1),
+                    time_in_force: TimeInForce::Gtc,
+                    post_only: false,
                 },
                 GatewayCommand::Cancel { client_order_id } => GatewayCommand::Cancel {
                     client_order_id: client_order_id ^ (1 << 63),
@@ -1069,11 +1278,14 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
                     replacement_client_order_id,
                     price_ticks,
                     quantity_lots,
+                    ..
                 } => GatewayCommand::Replace {
                     client_order_id,
                     replacement_client_order_id: replacement_client_order_id ^ (1 << 63),
                     price_ticks,
                     quantity_lots,
+                    time_in_force: TimeInForce::Gtc,
+                    post_only: false,
                 },
             };
             requests.push(conflict);
@@ -1116,6 +1328,8 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
                 },
                 price_ticks,
                 quantity_lots,
+                time_in_force: TimeInForce::Gtc,
+                post_only: false,
             }
         } else if command_kind < 78 {
             GatewayCommand::Cancel {
@@ -1127,6 +1341,8 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
                 replacement_client_order_id: next(&mut state) % 64,
                 price_ticks: 98 + (next(&mut state) % 9) as i64,
                 quantity_lots: 1 + (next(&mut state) % 12),
+                time_in_force: TimeInForce::Gtc,
+                post_only: false,
             }
         };
         let request = GatewayRequest {
@@ -1260,6 +1476,12 @@ proptest! {
             let client_order_id = index as u64 + 1;
             let price_ticks = i64::from(raw_price % 120);
             let quantity_lots = u64::from(raw_quantity % 20);
+            let time_in_force = match flags % 4 {
+                1 => TimeInForce::Ioc,
+                2 => TimeInForce::Fok,
+                _ => TimeInForce::Gtc,
+            };
+            let post_only = flags % 4 == 3;
             let command = match kind % 3 {
                 0 => GatewayCommand::New {
                     client_order_id,
@@ -1267,6 +1489,8 @@ proptest! {
                     side: if flags & 2 == 0 { Side::Buy } else { Side::Sell },
                     price_ticks,
                     quantity_lots,
+                    time_in_force,
+                    post_only,
                 },
                 1 => GatewayCommand::Cancel { client_order_id: u64::from(flags % 16) },
                 _ => GatewayCommand::Replace {
@@ -1274,6 +1498,8 @@ proptest! {
                     replacement_client_order_id: client_order_id + 1000,
                     price_ticks,
                     quantity_lots,
+                    time_in_force,
+                    post_only,
                 },
             };
             let request = GatewayRequest { client_id, request_id: index as u64 + 1, command };

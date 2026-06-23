@@ -494,6 +494,8 @@ mod tests {
                     side: Side::Sell,
                     price_ticks: 100,
                     quantity_lots: 5,
+                    time_in_force: crate::TimeInForce::Gtc,
+                    post_only: false,
                 },
             },
             GatewayRequest {
@@ -505,6 +507,8 @@ mod tests {
                     side: Side::Buy,
                     price_ticks: 100,
                     quantity_lots: 2,
+                    time_in_force: crate::TimeInForce::Gtc,
+                    post_only: false,
                 },
             },
             GatewayRequest {
@@ -515,6 +519,8 @@ mod tests {
                     replacement_client_order_id: 11,
                     price_ticks: 99,
                     quantity_lots: 3,
+                    time_in_force: crate::TimeInForce::Gtc,
+                    post_only: false,
                 },
             },
             GatewayRequest {
@@ -526,6 +532,8 @@ mod tests {
                     side: Side::Buy,
                     price_ticks: 100,
                     quantity_lots: 2,
+                    time_in_force: crate::TimeInForce::Gtc,
+                    post_only: false,
                 },
             },
         ]
@@ -588,6 +596,8 @@ mod tests {
                 side: Side::Buy,
                 price_ticks: 90,
                 quantity_lots: 1,
+                time_in_force: crate::TimeInForce::Gtc,
+                post_only: false,
             },
             ..request
         };
@@ -725,6 +735,8 @@ mod tests {
                         side: if n % 2 == 0 { Side::Buy } else { Side::Sell },
                         price_ticks: 100 + (n % 5) as i64,
                         quantity_lots: 1,
+                        time_in_force: crate::TimeInForce::Gtc,
+                        post_only: false,
                     },
                 })
                 .unwrap();

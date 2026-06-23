@@ -327,30 +327,54 @@ impl MatchingEngine {
 
     /// Replace by canceling the old order and submitting a fresh ID without inherited priority.
     pub fn replace(&mut self, old_order_id: OrderId, replacement: OrderRequest) -> ReplaceResult {
-        if replacement.price_ticks <= 0 {
-            return ReplaceResult::rejected(RejectReason::InvalidPrice);
-        }
-        if replacement.quantity_lots == 0 {
-            return ReplaceResult::rejected(RejectReason::InvalidQuantity);
-        }
-        if self.used_order_ids.contains(&replacement.order_id) {
-            return ReplaceResult::rejected(RejectReason::DuplicateOrderId);
-        }
-        if !self.live_orders.contains_key(&old_order_id) {
-            return ReplaceResult::rejected(RejectReason::UnknownOrderId);
-        }
-        if self.next_sequence >= Sequence::MAX - 1 {
-            return ReplaceResult::rejected(RejectReason::SequenceExhausted);
+        self.replace_with_options(old_order_id, replacement, OrderOptions::default())
+    }
+
+    /// Replace atomically with respect to policy rejection: validate the new order before
+    /// cancelling the old one, then apply cancel and submit under the caller's serialization.
+    pub fn replace_with_options(
+        &mut self,
+        old_order_id: OrderId,
+        replacement: OrderRequest,
+        options: OrderOptions,
+    ) -> ReplaceResult {
+        if let Err(reason) = self.preflight_replace(old_order_id, replacement, options) {
+            return ReplaceResult::rejected(reason);
         }
         self.cancel(old_order_id)
-            .expect("order existence and sequence checked");
+            .expect("preflight confirmed live order and sequence capacity");
         let cancelled_sequence = Some(self.next_sequence);
-        let result = self.submit(replacement);
+        let result = self.submit_with_options(replacement, options);
         ReplaceResult {
             cancelled_sequence,
             replacement: result,
             rejection: None,
         }
+    }
+
+    /// Check replacement policy without changing the old order or consuming the new ID.
+    pub fn preflight_replace(
+        &self,
+        old_order_id: OrderId,
+        replacement: OrderRequest,
+        options: OrderOptions,
+    ) -> Result<(), RejectReason> {
+        if replacement.price_ticks <= 0 {
+            return Err(RejectReason::InvalidPrice);
+        }
+        if replacement.quantity_lots == 0 {
+            return Err(RejectReason::InvalidQuantity);
+        }
+        if self.used_order_ids.contains(&replacement.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        if !self.live_orders.contains_key(&old_order_id) {
+            return Err(RejectReason::UnknownOrderId);
+        }
+        if self.next_sequence >= Sequence::MAX - 1 {
+            return Err(RejectReason::SequenceExhausted);
+        }
+        self.preflight(replacement, options)
     }
 
     pub fn best_bid(&self) -> Option<(PriceTicks, u128)> {
