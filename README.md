@@ -99,6 +99,8 @@ Example request:
 
 Prices are integer ticks and quantities are integer lots. The fixture shows an acknowledgement, partial fill, cancel/replace, full fill, and idempotent retry. Run `exchange-sim` without `--input` to read JSONL from standard input.
 
+New-order and replacement JSON may include `"time_in_force":"ioc"`, `"time_in_force":"fok"`, or `"post_only":true`. GTC and `post_only:false` remain the defaults. IOC cancels any remainder; FOK rejects before book or engine-sequence mutation when visible depth is insufficient; post-only rejects a crossing order.
+
 ### Persist and recover a simulated session
 
 ```powershell
@@ -144,7 +146,7 @@ The exchange benchmark prints CSV rows. `--core` requests thread affinity and ex
 
 `cargo test` includes the independent reference comparisons, property-generated command sequences, journal corruption/truncation and recovery cases, and multi-client concurrency tests. The reference matcher intentionally uses a flat order vector and scans for matches, unlike the production matcher's indexed price levels and FIFO queues.
 
-The gateway is in-process JSONL, not TCP, FIX, or a production order-management system. It models limit orders and does not model auctions, fees, venue-specific order types, exchange/network latency, or live order routing. Market-data capture has not been qualified as a lossless production feed handler. The queue benchmark's zero-loss claim applies only to its tested synthetic workload, bounded queue, retry policy, and hardware.
+The gateway is in-process JSONL, not TCP, FIX, or a production order-management system. It models GTC, IOC, FOK, and post-only limit behavior, but does not model auctions, fees, self-trade prevention, venue-specific order types, exchange/network latency, or live order routing. Market-data capture has not been qualified as a lossless production feed handler. The queue benchmark's zero-loss claim applies only to its tested synthetic workload, bounded queue, retry policy, and hardware.
 
 ## Built with
 

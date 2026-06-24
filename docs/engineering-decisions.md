@@ -67,7 +67,7 @@ This ledger records decisions that constrain implementation. Revisit a decision 
 
 ## DEC-010 — Initial advanced order semantics
 
-- **Status:** Accepted specification; code pending
+- **Status:** Accepted and implemented in matcher and in-process gateway (`fab4ef9`)
 - **Decision:** GTC remains the default; IOC takes available crossing liquidity then cancels its remainder; FOK uses a serialized all-or-none preflight over visible book quantity; post-only rejects a would-take order without repricing.
 - **Reason:** These policies are deterministic with the current single sequencing point and preserve existing price-time priority for any quantity that rests.
-- **Consequence:** FOK check and match commit must be atomic under the same serialized request. An unfillable FOK or crossing post-only request does not mutate book state or allocate an engine sequence/order ID. The client order ID remains reserved under current gateway semantics. Replacement flags govern the new order and never transfer old priority.
+- **Consequence:** FOK check and match commit are atomic under the same serialized request. An unfillable FOK or crossing post-only request does not mutate book state or allocate an engine sequence/exchange order ID. The client order ID remains reserved under current gateway semantics. Replacement flags govern the new order and never transfer old priority. Terminal cancel reports expose zero leaves.

@@ -12,12 +12,12 @@
 - Prices are positive integer ticks; quantities are positive integer lots and must satisfy configured quantity and notional limits.
 - Books are isolated by symbol. A buy crosses the lowest resting ask at or below its limit; a sell crosses the highest resting bid at or above its limit.
 - Matching consumes the oldest order at the best price first. Trades execute at the resting order's price. A remaining incoming quantity rests with a new priority sequence.
-- Cancel removes remaining quantity. Replace is cancel plus a newly accepted order with a new client order ID and loses all previous time priority. A rejected replacement leaves the original order unchanged.
+- Cancel removes remaining quantity. Terminal cancel reports and snapshots use zero leaves; cumulative fills retain the amount already executed. Replace is cancel plus a newly accepted order with a new client order ID and loses all previous time priority. A rejected replacement leaves the original order unchanged.
 - Each execution report has a monotonically increasing global report sequence and is delivered to the client represented by that report. A fill produces reports for both maker and taker.
 
-## Advanced order policy (implementation pending)
+## Advanced order policy
 
-The first advanced-order slice will use these explicit semantics; they are not yet accepted by the current gateway API:
+The matcher and in-process gateway implement these policies. `time_in_force` and `post_only` may be sent in JSONL; omitted fields retain the GTC/non-post-only defaults.
 
 - **GTC:** the existing default. Match any immediately executable quantity and rest the remainder.
 - **IOC:** execute immediately against all eligible visible price levels. Cancel any remainder without adding it to the book. The client receives fill reports and a final cancelled/leaves-zero report when quantity remains; an IOC with no match is accepted then cancelled.
@@ -25,7 +25,9 @@ The first advanced-order slice will use these explicit semantics; they are not y
 - **Post-only:** reject an order if it would execute against the current opposite book. Do not reprice or adjust it. Rejection leaves the book and engine sequence unchanged; the client order ID remains consumed.
 - **Replacement:** remains cancel-and-new with no inherited priority. The replacement's explicit TIF/post-only flags apply to the new order; omitted flags use GTC/non-post-only defaults.
 
-FOK preflight and commit must be performed under the same serialized exchange operation. These semantics apply only to visible liquidity in this simulator and do not claim exchange protocol compatibility.
+FOK preflight and commit are performed under the same serialized exchange operation. Replacement preflights the new policy before cancelling the old order. The in-process gateway reserves the client order ID for rejected commands, but does not consume an exchange order ID or engine sequence for a post-only or insufficient-depth FOK rejection. These semantics apply only to visible liquidity in this simulator and do not claim exchange protocol compatibility.
+
+Post-only is valid only with GTC. Unsupported combinations are rejected. IOC and FOK replacement orders use the same preflight rules. The gateway emits a final IOC cancelled report when quantity remains, with zero leaves; fills remain separately reported to both clients.
 
 The production matcher uses indexed price levels and FIFO queues. A test-only reference model uses a flat order vector and scans it for the best eligible order, intentionally trading speed for implementation independence. It compares per-command outcomes, fills, visible resting-book order, quotes and periodic complete state fingerprints.
 

@@ -10,10 +10,10 @@ The audit was performed on local HEAD `8945ced` (56 commits in the local history
 
 | Area | Current state | Main gap |
 | --- | --- | --- |
-| Matching | FIFO price-time engine, integer ticks/lots, cancel and replace; pinned 10M benchmark | IOC/FOK/post-only, STP, expiration/session semantics |
-| Gateway | In-process multi-client JSONL, reports, quantity/notional limits, ownership and idempotency | Sessions, client exposure/position/rate controls, network transport |
-| Correctness | Independent flat-vector gateway model, 100K commands across 5 seeds, proptest, invariants | Reference coverage for future order/risk/session types and larger books |
-| Journal | v1 JSONL append/recovery, per-command full state fingerprints, checksums and truncation detection | Full-state hash per event is the measured throughput bottleneck; no checkpoint/batch policy |
+| Matching | FIFO price-time engine, integer ticks/lots, cancel/replace, GTC/IOC/FOK/post-only; pinned 10M benchmark | STP, expiry and session semantics |
+| Gateway | In-process multi-client JSONL with advanced order policies, reports, limits, ownership and idempotency | Sessions, client exposure/position/rate controls, network transport |
+| Correctness | Independent flat-vector model, 100K baseline commands across 5 seeds, proptest and invariants | Generated advanced-order cases added; broaden for risk/session types and deep books |
+| Journal | v1/v2 JSONL append/recovery, periodic full-state checkpoints, record checksums and truncation detection | Incremental fingerprints, snapshot acceleration and stronger persistence boundaries |
 | Market data | Provider-neutral L1/L2 normalization/replay, gaps, bounded writer, read-only IBKR capture | Reconnect/resubscribe lifecycle, stronger completeness/statistics; no exchange-book publisher |
 | Queues | Bounded channel and SPSC benchmarks with retry/no-loss checks | Queue tests do not represent the full live market-data path |
 | Paper trading | Not present | Deterministic account, positions, fees, slippage and example strategy |
