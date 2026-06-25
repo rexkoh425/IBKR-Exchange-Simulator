@@ -6,12 +6,12 @@ Last audited: 2026-11-10. Current local branch: `codex/exchange-simulator-roadma
 
 "Actual program commits" counts only commits created for this roadmap, not historical project work. Existing evidence is cited separately so completed features are not repeated.
 
-Current total: **8 program commits**: `f6e88d1`, `c5437fe`, `b59426a`, `176c675`, `c07de0e`, `6866750`, `fab4ef9`, plus this substantive specification/progress update.
+Current total: **9 program commits**: `f6e88d1`, `c5437fe`, `b59426a`, `176c675`, `c07de0e`, `6866750`, `fab4ef9`, `29a7dd6`, plus this substantive self-trade policy decision.
 
 | Milestone | Planned | Actual program commits | Status | Existing evidence / verification |
 | --- | ---: | ---: | --- | --- |
 | Exchange specification and architecture | 12 | 1 | Complete | `f6e88d1` adds the audited roadmap, architecture/boundary decisions and behavior specification. |
-| Advanced order handling | 14 | 4 | In progress | `c07de0e`, `6866750`, and `fab4ef9` specify and implement GTC/IOC/FOK/post-only end to end; STP, expiry and session rules remain. This document update records the completed slice. |
+| Advanced order handling | 14 | 5 | In progress | `c07de0e`, `6866750`, and `fab4ef9` specify and implement GTC/IOC/FOK/post-only end to end. DEC-011 now selects cancel-incoming STP; STP, expiry and session code remains. |
 | Pre-trade risk controls | 12 | 0 | Partial | Per-order quantity/notional limits exist; client exposure, positions, rate controls and kill switches are missing. |
 | Advanced correctness verification | 12 | 0 | Partial baseline exists | `src/reference_matcher.rs`: 100K deterministic commands across five seeds plus proptest; broaden when new semantics land. |
 | High-performance journaling | 14 | 3 | In progress | `c5437fe` adds v2 periodic checkpoints, v1 recovery/resume, configurable flush batches and replay outcome verification. `b59426a` retains five-trial scaling artifacts; `176c675` documents the policy. Incremental state hashing remains future work. |
@@ -52,6 +52,13 @@ Current total: **8 program commits**: `f6e88d1`, `c5437fe`, `b59426a`, `176c675`
 - **Correctness finding:** terminal cancel reports and snapshots now expose zero leaves while retaining cumulative fills. IOC emits fills, then a final cancelled/leaves-zero report when remainder remains. A failed policy check consumes neither engine sequence nor exchange order ID.
 - **Performance:** no performance optimization is claimed in this slice. Existing matcher and journal benchmark artifacts remain unchanged.
 - **Next:** define self-trade prevention semantics and choose reject/cancel policy before coding; then add it to both engines and generated differential tests.
+
+### Batch 3 — Self-trade prevention policy
+
+- **Date:** 2026-11-10
+- **Tasks:** selected and documented cancel-incoming-remainder semantics, including interaction with price/FIFO, partial external fills, FOK preflight and replacement.
+- **Commits:** this policy/specification commit; implementation is next and this batch remains in progress.
+- **Acceptance:** next slice must compare both matchers after each command, prove no own fill and prove resting self order is unchanged.
 
 ## Current risks and blockers
 

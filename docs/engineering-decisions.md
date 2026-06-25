@@ -71,3 +71,10 @@ This ledger records decisions that constrain implementation. Revisit a decision 
 - **Decision:** GTC remains the default; IOC takes available crossing liquidity then cancels its remainder; FOK uses a serialized all-or-none preflight over visible book quantity; post-only rejects a would-take order without repricing.
 - **Reason:** These policies are deterministic with the current single sequencing point and preserve existing price-time priority for any quantity that rests.
 - **Consequence:** FOK check and match commit are atomic under the same serialized request. An unfillable FOK or crossing post-only request does not mutate book state or allocate an engine sequence/exchange order ID. The client order ID remains reserved under current gateway semantics. Replacement flags govern the new order and never transfer old priority. Terminal cancel reports expose zero leaves.
+
+## DEC-011 â€” Self-trade prevention cancels the incoming remainder
+
+- **Status:** Accepted policy; implementation pending
+- **Decision:** Stop the incoming order before its next eligible maker if both orders belong to the same client. Keep the resting order and cancel any incoming remainder; external fills completed earlier in the price/FIFO walk remain valid.
+- **Reason:** This deterministic policy avoids internal self-fills while preserving the resting order's priority and making no unsupported venue-specific compliance claim.
+- **Consequence:** FOK availability excludes same-client orders. The self-trade guard is evaluated at the same serialized matching point as preflight/commit. The incoming exchange order ID and engine sequence are allocated only if the order passes policy preflight; an encountered self order after matching begins cancels the remainder.

@@ -29,6 +29,12 @@ FOK preflight and commit are performed under the same serialized exchange operat
 
 Post-only is valid only with GTC. Unsupported combinations are rejected. IOC and FOK replacement orders use the same preflight rules. The gateway emits a final IOC cancelled report when quantity remains, with zero leaves; fills remain separately reported to both clients.
 
+## Self-trade prevention
+
+The simulator uses **cancel incoming remainder**. During the normal best-price/FIFO walk, if the next eligible maker belongs to the incoming client's own account, matching stops before that maker is changed. Any fills already made against earlier external orders remain valid; the incoming order is then cancelled with zero leaves, and the resting self order remains unchanged. If there were no earlier external fills, the gateway reports acceptance followed by cancellation. No self trade is emitted.
+
+For FOK, same-client resting quantity is excluded from preflight availability. If external visible quantity cannot fill the entire order before a self order would be reached, the FOK is rejected without book mutation or engine/exchange ID allocation. The self-trade check and matching walk run within the same serialized gateway operation. Replacements use the same policy after preflighting and preserve the old order if validation rejects.
+
 The production matcher uses indexed price levels and FIFO queues. A test-only reference model uses a flat order vector and scans it for the best eligible order, intentionally trading speed for implementation independence. It compares per-command outcomes, fills, visible resting-book order, quotes and periodic complete state fingerprints.
 
 ## Journal and recovery guarantees
