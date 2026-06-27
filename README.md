@@ -1,54 +1,56 @@
 # Equity Matching Engine & Market Replay
 
-**A deterministic, single-process exchange simulator and market-data laboratory written in Rust.** Explore FIFO price-time matching, client order lifecycles, bounded event queues, and replayable market data with repeatable correctness and performance checks.
+**A deterministic Rust exchange simulator and market-data replay lab.** The project combines a FIFO price-time matcher, an in-process multi-client order gateway, an append-only replay journal, a bounded SPSC pipeline, and read-only IBKR market-data capture.
 
-> This is a research and portfolio project. The IBKR adapter captures market data only; the simulator does not route orders to a broker or exchange. Synthetic benchmark results are not live-market performance claims.
+> Portfolio and research software. The IBKR adapter captures data only and does not route orders. Synthetic benchmark results describe the tested workloads and machine; they are not live-market or production-exchange performance claims.
 
-## Project snapshot
+## Why this project
 
-| | |
+This repository is a hands-on systems project for exploring how exchange-style order handling, deterministic replay, data integrity, and low-latency measurement fit together. It is useful for:
+
+- **Recruiters:** a compact demonstration of Rust systems work, measurable performance, and correctness evidence.
+- **Trading-systems and market-data engineers:** a codebase for inspecting FIFO matching, client order lifecycles, event processing, replay, and gap handling.
+- **Researchers and students:** a reproducible simulator for experimenting with order behavior and synthetic event workloads without sending real orders.
+
+## At a glance
+
+| Component | What is implemented |
 | --- | --- |
-| **Language** | Rust 2021 |
-| **Core** | FIFO price-time matching with integer ticks and lots |
-| **Gateway** | In-process JSONL simulator with multiple logical clients |
-| **Replay** | Deterministic event and journal recovery with checksums |
-| **Market data** | Provider-neutral L1/L2 types and an optional read-only IBKR capture adapter |
-| **Queues** | Bounded blocking and SPSC pipeline benchmarks |
-| **Verification** | Unit tests, proptest, independent reference model, fixed-seed benchmarks |
+| Matching engine | Per-symbol FIFO price-time books using integer ticks and lots |
+| Simulated order gateway | In-process JSONL commands, multiple logical clients, ownership checks, idempotent retries, and sequenced reports |
+| Order policies | GTC, IOC, FOK, post-only, and cancel-incoming-remainder self-trade prevention |
+| Correctness | Independent flat-vector reference matcher, deterministic randomized comparisons, and property-based tests |
+| Exchange journal | Versioned append-only JSONL records, checksums, checkpoints, corruption detection, and replay recovery |
+| Market data | Normalized L1/L2 records, offline depth replay and gap detection, plus optional read-only IBKR capture |
+| Event pipeline | Bounded SPSC processing and synthetic load benchmarks |
 
 ## Measured results
 
-Results below were measured on an AMD Ryzen 9 9900X / Windows x86_64 release build. See the linked reports and raw trial files for exact workload, affinity, timing boundaries, and limitations.
+These are measured synthetic workloads on Windows x86_64 with an AMD Ryzen 9 9900X release build. Pinning and workload details are in the linked artifacts. The reported service latency is not end-to-end live-market latency.
 
-| Area | Result | What the number means |
+| Workload | Result | Scope |
 | --- | --- | --- |
-| **Matching core** | **5.91M commands/s median; 400 ns p99** | Five pinned trials of 10M synthetic mixed submit/cancel commands on one logical CPU. |
-| **Independent correctness** | **100,000 commands; 5 seeds; 0 mismatches** | Production gateway checked against a deliberately different flat-vector matcher; proptest adds generated sequences. |
-| **Bounded SPSC queue** | **1.0003–1.0005M events/s; 0 loss; 0.597–0.623 us p99** | Three pinned 10M-event trials. Consumer computes a checksum; this does not include matching or persistence. |
-| **Parsed simulated gateway** | **519.7k requests/s median; 8.7 us p99** | Five frozen-workload trials of 1,000 JSONL requests per trial. Treat as an initial small-workload baseline. |
-| **Gateway with journal** | **157.6k requests/s median; 24.1 us p99 at 1K** | Schema v2 checkpoints full state every 4,096 commands by default and validates each replayed command. |
-| **Journal scaling** | **119.9k/s at 10K; 36.3k/s at 100K** | Five pinned runs per workload, p99 of 26.8 us / 32.6 us. Full-state checkpoint work still creates rare long maximum-latency spikes. |
-| **Journal replay** | **37.6k records/s; 11.6 us p99 at 100K** | Replays and validates the entire journal; final state fingerprint is recomputed. |
+| Matching core | **5.91M commands/s median; 400 ns p99** | Five pinned trials, 10M fixed-seed mixed submit/cancel commands per trial; one logical CPU. |
+| Independent correctness | **100,000 commands; 5 seeds; 0 mismatches** | Production gateway compared command by command with an independently structured reference model; property tests cover generated sequences. |
+| Bounded SPSC pipeline | **1.0003-1.0005M events/s; 0 loss; 0.597-0.623 us p99** | Three pinned 10M-event synthetic trials with a checksum consumer; excludes matching and persistence. |
+| Parsed gateway with STP | **508.6k requests/s median; 5.0 us p99** | Five pinned trials of 10,000 frozen JSONL requests. Against a same-workload pre-STP baseline, throughput was 5.1% lower and p99 6.4% higher. |
+| Gateway plus journal | **119.9k commands/s at 10K; 36.3k/s at 100K** | Schema-v2 checkpoint interval 4,096; five pinned trials per workload. Full-state checks create long tail spikes. |
+| Journal replay | **37.6k records/s; 11.6 us p99 at 100K** | Replays and validates the complete journal, then recomputes the final state fingerprint. |
 
-The matcher rerun was below an earlier 6.68M/s result, so no speedup is claimed. The journal's measured v2 throughput depends on checkpoint interval and workload size; a full fingerprint per entry reproduces the slower ~1.6K/s baseline. The SPSC result is a simple synthetic queue test, not evidence that the IBKR capture path sustains one million live market events per second. The exchange journal flushes records but does not call `fsync` or `FlushFileBuffers`.
+The matcher result supports the synthetic matching-only target of more than 5M commands/s with p99 below 1 us on this machine. The SPSC result applies only to its bounded synthetic queue workload and retry policy. Neither result establishes live IBKR capture capacity. Journal writes flush through the OS file API but do not call `fsync` or `FlushFileBuffers`, so power-loss durability is not claimed.
 
-- [Benchmark report and gateway/replay raw trials](benchmarks/exchange-gateway-benchmark-2026-11-10.md)
-- [Journal v2 checkpoint scaling and raw trials](benchmarks/journal-v2-scaling-2026-11-10.md)
-- [Pinned 10M matcher raw trials](benchmarks/matcher-10m-pinned-rerun-2026-11-10.csv) and [prior matcher run](benchmarks/matcher-10m-2026-11-09.md)
+### Benchmark evidence
+
+- [Exchange, journal, and replay report](benchmarks/exchange-gateway-benchmark-2026-11-10.md) and [raw trials](benchmarks/exchange-gateway-benchmark-2026-11-10.csv)
+- [Self-trade-prevention gateway trials](benchmarks/exchange-stp-gateway-2026-11-10.csv)
+- [Journal checkpoint scaling report](benchmarks/journal-v2-scaling-2026-11-10.md)
+- [Pinned 10M matcher rerun](benchmarks/matcher-10m-pinned-rerun-2026-11-10.csv) and [earlier matcher report](benchmarks/matcher-10m-2026-11-09.md)
 - [Pinned SPSC queue report](benchmarks/pinned-spsc-10m-2026-11-09.md)
-- [SPSC telemetry optimization report and paired raw trials](benchmarks/pipeline-optimization-2026-11-10.md)
-
-## What it can be used for
-
-- **Exchange mechanics experiments:** study price-time priority, maker-price fills, partial execution, cancellation, and replacement priority.
-- **Order lifecycle and client behavior:** exercise idempotent retries, duplicate IDs, ownership checks, risk limits, and execution reports without placing real orders.
-- **Deterministic replay:** reproduce a JSONL session, inspect market-depth gaps, validate a journal after restart, and compare stable state checksums.
-- **Low-latency engineering practice:** measure matcher service time and queue behavior under frozen synthetic workloads; compare changes without changing the workload.
-- **IBKR market-data development:** capture and normalize read-only Level 1 quotes/trades and positional Level 2 depth from an already-running TWS or IB Gateway session.
+- [SPSC pipeline optimization report](benchmarks/pipeline-optimization-2026-11-10.md)
 
 ## Architecture
 
-The two data paths are independent today; the market-data replay path does not feed the simulated exchange gateway automatically.
+The market-data and simulated-order paths are independent. Captured market data does not automatically drive the simulator's order book.
 
 ```mermaid
 flowchart LR
@@ -72,16 +74,16 @@ flowchart LR
   end
 ```
 
-## Matching and gateway behavior
+## Exchange behavior
 
-- Integer price ticks and quantity lots avoid floating-point comparisons in the matching core.
-- Each symbol has an independent book. The best price trades first; orders at the same price trade FIFO. Fills execute at the resting order's price.
-- A replace cancels the old order and submits a new client order ID, giving it new time priority. A rejected replacement leaves the old order live.
-- Request IDs are scoped to a client. An identical retry returns cached reports; reuse with changed command content is rejected. Client ownership is enforced for cancels and replacements.
-- A fill generates sequenced execution reports for both the resting and incoming clients. Quantity/notional risk limits are configurable.
-- The journal stores requests, outcomes, checksums, and monotone journal sequence numbers. Recovery rejects sequence gaps, corrupt entries, and a truncated final record.
+- Best price trades first; equal-price orders execute FIFO at the resting maker's price.
+- Cancel removes remaining quantity. Replace is cancel-and-new, so it loses time priority; a rejected replacement leaves the original order live.
+- Request IDs are scoped by client. Identical retries return cached reports; reuse with different content is rejected. Cancels and replacements enforce ownership.
+- GTC rests any unfilled remainder. IOC cancels the remainder. FOK rejects atomically when visible eligible quantity is insufficient. Post-only rejects a crossing order.
+- Self-trade prevention stops before the next same-client maker, keeps that resting order unchanged, and cancels the incoming remainder. External fills earlier in the FIFO walk remain valid.
+- Quantity and notional limits are configurable. Execution reports carry a deterministic global sequence and are associated with the relevant client.
 
-Full rules and persistence limits are in [the order-handling specification](docs/exchange-order-handling.md).
+Read the [order-handling specification](docs/exchange-order-handling.md) for exact semantics, replay guarantees, and edge cases.
 
 ## Quick start
 
@@ -97,20 +99,18 @@ Example request:
 {"client_id":7,"request_id":1,"command":{"type":"new","client_order_id":101,"symbol":"AAPL","side":"Buy","price_ticks":19000,"quantity_lots":25}}
 ```
 
-Prices are integer ticks and quantities are integer lots. The fixture shows an acknowledgement, partial fill, cancel/replace, full fill, and idempotent retry. Run `exchange-sim` without `--input` to read JSONL from standard input.
+Prices are integer ticks and quantities are integer lots. The fixture exercises acknowledgements, fills, cancel/replace, and an idempotent retry. Run `exchange-sim` without `--input` to read JSONL requests from standard input. New and replacement orders may set `"time_in_force":"ioc"`, `"time_in_force":"fok"`, or `"post_only":true`; omitted fields default to GTC and non-post-only.
 
-New-order and replacement JSON may include `"time_in_force":"ioc"`, `"time_in_force":"fok"`, or `"post_only":true`. GTC and `post_only:false` remain the defaults. IOC cancels any remainder; FOK rejects before book or engine-sequence mutation when visible depth is insufficient; post-only rejects a crossing order.
-
-### Persist and recover a simulated session
+### Persist and recover a session
 
 ```powershell
 cargo run --release -- exchange-sim --input fixtures/exchange-session.jsonl --journal exchange.jsonl --summary original.json --state-checksum-interval 4096
 cargo run --release -- exchange-recover --journal exchange.jsonl --output recovered.json
 ```
 
-Compare the summaries to confirm reconstructed order state, reports, and final checksum. Schema v2 writes a full-state checkpoint every 4,096 commands by default; use `--state-checksum-interval 1` for a full state fingerprint on every record. `--flush-every N` batches writer flushes (default 1). The journal is separate from IBKR market-depth recordings and does not promise power-loss durability.
+Compare the summaries to verify reconstructed order state, reports, and final checksum. The journal is separate from IBKR market-depth recordings. It detects corrupt entries, sequence gaps, and a truncated final record. The CLI flushes records, but does not promise durability across power loss or an OS/storage failure.
 
-### Optional IBKR read-only capture
+### Optional read-only IBKR capture
 
 Copy `.env.example` to `.env`, start and log in to TWS or IB Gateway, then run:
 
@@ -118,36 +118,34 @@ Copy `.env.example` to `.env`, start and log in to TWS or IB Gateway, then run:
 cargo run --release -- ibkr-capture
 ```
 
-The adapter uses the local socket settings in `.env` and writes market-data JSONL under `data/ibkr/`. It does not send orders. Actual IBKR connection, entitlements, disk behavior, and capture completeness must be verified in the user's own environment; they are not established by the synthetic tests here.
+The adapter reads local socket settings from `.env` and writes market-data JSONL under `data/ibkr/`. It does not send orders. Connection, entitlements, and capture completeness must be checked in the user's IBKR environment.
 
-## Reproduce benchmarks
+## Reproduce the benchmarks
 
-Matcher core, pinned to a logical CPU on Windows:
+Matching core, pinned to a logical CPU on Windows:
 
 ```powershell
 cargo run --release -- benchmark --events 10000000 --seed 20261109 --trials 5 --warmup-events 100000 --core 0
 ```
 
-Full simulated gateway, journal, and replay stages:
+Parsed gateway, journal, and replay stages:
 
 ```powershell
-cargo run --release -- exchange-benchmark --events 1000 --trials 5 --seed 20261110 --core 0
+cargo run --release -- exchange-benchmark --events 10000 --trials 5 --seed 20261110 --core 0
 ```
 
-Bounded single-producer/single-consumer checksum pipeline:
+Bounded SPSC checksum pipeline:
 
 ```powershell
 cargo run --release -- pipeline-benchmark --queue spsc --events 10000000 --rate 1005000 --capacity 65536 --trials 3 --producer-core 0 --consumer-core 12
 ```
 
-The exchange benchmark prints CSV rows. `--core` requests thread affinity and exits if pinning fails. For the pipeline benchmark, check the printed pin-success values and preserve the complete CSV output. Do not compare pinned and unpinned runs as if affinity were an optimization.
+The exchange benchmark prints CSV rows. `--core` requests affinity and exits if pinning fails. For the pipeline benchmark, check the pin-success fields and retain the complete output. Compare pinned results with pinned results on the same workload; do not treat an affinity or workload change as an optimization gain.
 
-## Correctness and scope
+## Scope and limitations
 
-`cargo test` includes the independent reference comparisons, property-generated command sequences, journal corruption/truncation and recovery cases, and multi-client concurrency tests. The reference matcher intentionally uses a flat order vector and scans for matches, unlike the production matcher's indexed price levels and FIFO queues.
-
-The gateway is in-process JSONL, not TCP, FIX, or a production order-management system. It models GTC, IOC, FOK, and post-only limit behavior, but does not model auctions, fees, self-trade prevention, venue-specific order types, exchange/network latency, or live order routing. Market-data capture has not been qualified as a lossless production feed handler. The queue benchmark's zero-loss claim applies only to its tested synthetic workload, bounded queue, retry policy, and hardware.
+The order gateway is an in-process JSONL simulator, not TCP, FIX, or a production OMS. The project does not model auctions, fees, venue-specific protocols, network latency, or live order routing. The IBKR path is a read-only capture adapter and has not been qualified as a lossless production feed handler. Synthetic zero-loss results apply only to the tested queue, retry policy, workload, and hardware.
 
 ## Built with
 
-Rust, Serde/JSON, `rtrb` SPSC ring buffer, `core_affinity`, `ibapi`, and proptest.
+Rust, Serde/JSON, `rtrb`, `core_affinity`, `ibapi`, and proptest.
