@@ -91,6 +91,7 @@ pub struct SubmitResult {
     pub sequence: Option<Sequence>,
     pub trades: Vec<Trade>,
     pub resting_quantity_lots: QuantityLots,
+    pub self_trade_prevented: bool,
     pub rejection: Option<RejectReason>,
 }
 
@@ -100,6 +101,7 @@ impl SubmitResult {
             sequence: None,
             trades: Vec::new(),
             resting_quantity_lots: 0,
+            self_trade_prevented: false,
             rejection: Some(reason),
         }
     }
@@ -134,6 +136,7 @@ struct LiveOrder {
     price_ticks: PriceTicks,
     remaining_lots: QuantityLots,
     sequence: Sequence,
+    owner_id: Option<u64>,
     previous: Option<OrderId>,
     next: Option<OrderId>,
 }
@@ -163,6 +166,16 @@ impl MatchingEngine {
         request: OrderRequest,
         options: OrderOptions,
     ) -> Result<(), RejectReason> {
+        self.preflight_for_client(request, options, None)
+    }
+
+    /// Validate matching policy while excluding same-client makers from FOK liquidity.
+    pub fn preflight_for_client(
+        &self,
+        request: OrderRequest,
+        options: OrderOptions,
+        owner_id: Option<u64>,
+    ) -> Result<(), RejectReason> {
         if request.price_ticks <= 0 {
             return Err(RejectReason::InvalidPrice);
         }
@@ -181,11 +194,15 @@ impl MatchingEngine {
         if options.post_only && self.would_cross(request.side, request.price_ticks) {
             return Err(RejectReason::PostOnlyWouldTake);
         }
-        if options.time_in_force == TimeInForce::Fok
-            && self.available_crossing_quantity(request.side, request.price_ticks)
-                < u128::from(request.quantity_lots)
-        {
-            return Err(RejectReason::FillOrKillUnavailable);
+        if options.time_in_force == TimeInForce::Fok {
+            let available = self.available_crossing_quantity_for_client(
+                request.side,
+                request.price_ticks,
+                owner_id,
+            );
+            if available < u128::from(request.quantity_lots) {
+                return Err(RejectReason::FillOrKillUnavailable);
+            }
         }
         Ok(())
     }
@@ -196,7 +213,17 @@ impl MatchingEngine {
         request: OrderRequest,
         options: OrderOptions,
     ) -> SubmitResult {
-        if let Err(reason) = self.preflight(request, options) {
+        self.submit_with_options_for_client(request, options, None)
+    }
+
+    /// Match while preventing executions against same-client resting orders.
+    pub fn submit_with_options_for_client(
+        &mut self,
+        request: OrderRequest,
+        options: OrderOptions,
+        owner_id: Option<u64>,
+    ) -> SubmitResult {
+        if let Err(reason) = self.preflight_for_client(request, options, owner_id) {
             return SubmitResult::rejected(reason);
         }
         let Some(sequence) = self.allocate_sequence() else {
@@ -206,6 +233,7 @@ impl MatchingEngine {
 
         let mut remaining = request.quantity_lots;
         let mut trades = Vec::new();
+        let mut self_trade_prevented = false;
         while remaining > 0 {
             let best_price = match request.side {
                 Side::Buy => self
@@ -232,6 +260,10 @@ impl MatchingEngine {
                 .and_then(|level| level.head)
                 .expect("price level has a first order");
             let maker = *self.live_orders.get(&maker_id).expect("level head is live");
+            if owner_id.is_some() && maker.owner_id == owner_id {
+                self_trade_prevented = true;
+                break;
+            }
             let fill_quantity = remaining.min(maker.remaining_lots);
             remaining -= fill_quantity;
             trades.push(Trade {
@@ -261,16 +293,23 @@ impl MatchingEngine {
         }
 
         let resting_quantity_lots = if options.time_in_force == TimeInForce::Gtc {
-            if remaining > 0 {
-                self.insert_live_order(RestingOrder {
-                    order_id: request.order_id,
-                    side: request.side,
-                    price_ticks: request.price_ticks,
-                    remaining_lots: remaining,
-                    sequence,
-                });
+            if remaining > 0 && !self_trade_prevented {
+                self.insert_live_order(
+                    RestingOrder {
+                        order_id: request.order_id,
+                        side: request.side,
+                        price_ticks: request.price_ticks,
+                        remaining_lots: remaining,
+                        sequence,
+                    },
+                    owner_id,
+                );
             }
-            remaining
+            if self_trade_prevented {
+                0
+            } else {
+                remaining
+            }
         } else {
             0
         };
@@ -278,6 +317,7 @@ impl MatchingEngine {
             sequence: Some(sequence),
             trades,
             resting_quantity_lots,
+            self_trade_prevented,
             rejection: None,
         }
     }
@@ -297,19 +337,42 @@ impl MatchingEngine {
         }
     }
 
-    fn available_crossing_quantity(&self, side: Side, price_ticks: PriceTicks) -> u128 {
+    fn available_crossing_quantity_for_client(
+        &self,
+        side: Side,
+        price_ticks: PriceTicks,
+        owner_id: Option<u64>,
+    ) -> u128 {
+        let mut quantity = 0_u128;
+        let mut include_level = |level: &PriceLevel| {
+            let mut order_id = level.head;
+            while let Some(id) = order_id {
+                let order = self.live_orders.get(&id).expect("FIFO node is live");
+                if owner_id.is_some() && order.owner_id == owner_id {
+                    return false;
+                }
+                quantity = quantity.saturating_add(u128::from(order.remaining_lots));
+                order_id = order.next;
+            }
+            true
+        };
         match side {
-            Side::Buy => self
-                .asks
-                .range(..=price_ticks)
-                .map(|(_, level)| level.total_quantity)
-                .fold(0_u128, u128::saturating_add),
-            Side::Sell => self
-                .bids
-                .range(price_ticks..)
-                .map(|(_, level)| level.total_quantity)
-                .fold(0_u128, u128::saturating_add),
+            Side::Buy => {
+                for level in self.asks.range(..=price_ticks).map(|(_, level)| level) {
+                    if !include_level(level) {
+                        break;
+                    }
+                }
+            }
+            Side::Sell => {
+                for level in self.bids.range(price_ticks..).rev().map(|(_, level)| level) {
+                    if !include_level(level) {
+                        break;
+                    }
+                }
+            }
         }
+        quantity
     }
 
     /// Remove a live order. Rejected cancellations do not advance sequence.
@@ -338,13 +401,26 @@ impl MatchingEngine {
         replacement: OrderRequest,
         options: OrderOptions,
     ) -> ReplaceResult {
-        if let Err(reason) = self.preflight_replace(old_order_id, replacement, options) {
+        self.replace_with_options_for_client(old_order_id, replacement, options, None)
+    }
+
+    /// Replace while applying same-client self-trade prevention to the new order.
+    pub fn replace_with_options_for_client(
+        &mut self,
+        old_order_id: OrderId,
+        replacement: OrderRequest,
+        options: OrderOptions,
+        owner_id: Option<u64>,
+    ) -> ReplaceResult {
+        if let Err(reason) =
+            self.preflight_replace_for_client(old_order_id, replacement, options, owner_id)
+        {
             return ReplaceResult::rejected(reason);
         }
         self.cancel(old_order_id)
             .expect("preflight confirmed live order and sequence capacity");
         let cancelled_sequence = Some(self.next_sequence);
-        let result = self.submit_with_options(replacement, options);
+        let result = self.submit_with_options_for_client(replacement, options, owner_id);
         ReplaceResult {
             cancelled_sequence,
             replacement: result,
@@ -358,6 +434,16 @@ impl MatchingEngine {
         old_order_id: OrderId,
         replacement: OrderRequest,
         options: OrderOptions,
+    ) -> Result<(), RejectReason> {
+        self.preflight_replace_for_client(old_order_id, replacement, options, None)
+    }
+
+    pub fn preflight_replace_for_client(
+        &self,
+        old_order_id: OrderId,
+        replacement: OrderRequest,
+        options: OrderOptions,
+        owner_id: Option<u64>,
     ) -> Result<(), RejectReason> {
         if replacement.price_ticks <= 0 {
             return Err(RejectReason::InvalidPrice);
@@ -374,7 +460,7 @@ impl MatchingEngine {
         if self.next_sequence >= Sequence::MAX - 1 {
             return Err(RejectReason::SequenceExhausted);
         }
-        self.preflight(replacement, options)
+        self.preflight_for_client(replacement, options, owner_id)
     }
 
     pub fn best_bid(&self) -> Option<(PriceTicks, u128)> {
@@ -527,7 +613,7 @@ impl MatchingEngine {
         }
     }
 
-    fn insert_live_order(&mut self, order: RestingOrder) {
+    fn insert_live_order(&mut self, order: RestingOrder, owner_id: Option<u64>) {
         let level = self
             .book_mut(order.side)
             .entry(order.price_ticks)
@@ -558,6 +644,7 @@ impl MatchingEngine {
                 price_ticks: order.price_ticks,
                 remaining_lots: order.remaining_lots,
                 sequence: order.sequence,
+                owner_id,
                 previous,
                 next: None,
             },
@@ -932,6 +1019,7 @@ mod tests {
                 sequence: Some(sequence),
                 trades,
                 resting_quantity_lots: remaining,
+                self_trade_prevented: false,
                 rejection: None,
             }
         }

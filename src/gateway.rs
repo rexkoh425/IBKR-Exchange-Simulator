@@ -329,6 +329,14 @@ impl SimulatedExchange {
             .sum()
     }
 
+    fn insert_live_order(&mut self, exchange_id: u64, key: ClientOrderKey) {
+        self.live_orders.insert(exchange_id, key);
+    }
+
+    fn remove_live_order(&mut self, exchange_id: u64) {
+        self.live_orders.remove(&exchange_id);
+    }
+
     pub fn order_states(&self) -> Vec<OrderStateSnapshot> {
         let mut states: Vec<_> = self
             .orders
@@ -575,13 +583,17 @@ impl SimulatedExchange {
             price_ticks,
             quantity_lots,
         };
-        let engine = self.engines.entry(symbol.clone()).or_default();
         // Policy rejections must not consume an exchange ID or engine sequence.
         let request = OrderRequest {
             order_id: candidate_id,
             ..request
         };
-        if let Err(reason) = engine.preflight(request, options) {
+        let preflight = self
+            .engines
+            .entry(symbol.clone())
+            .or_default()
+            .preflight_for_client(request, options, Some(client_id));
+        if let Err(reason) = preflight {
             return Ok(vec![self.reject(
                 client_id,
                 request_id,
@@ -598,12 +610,13 @@ impl SimulatedExchange {
             .engines
             .get_mut(&symbol)
             .expect("engine inserted above")
-            .submit_with_options(
+            .submit_with_options_for_client(
                 OrderRequest {
                     order_id: exchange_order_id,
                     ..request
                 },
                 options,
+                Some(client_id),
             );
         if let Some(reason) = result.rejection {
             return Ok(vec![self.reject(
@@ -645,6 +658,7 @@ impl SimulatedExchange {
             result.resting_quantity_lots,
             result.sequence,
             options.time_in_force,
+            result.self_trade_prevented,
         )
     }
 
@@ -690,7 +704,7 @@ impl SimulatedExchange {
             .expect("gateway live index and engine book agree");
         record.status = OrderStatus::Cancelled;
         self.orders.insert(key, record.clone());
-        self.live_orders.remove(&record.exchange_order_id);
+        self.remove_live_order(record.exchange_order_id);
         vec![self.report(
             client_id,
             request_id,
@@ -800,11 +814,13 @@ impl SimulatedExchange {
             price_ticks,
             quantity_lots,
         };
-        if let Err(reason) = self.engines[&old_record.symbol].preflight_replace(
+        let preflight = self.engines[&old_record.symbol].preflight_replace_for_client(
             old_record.exchange_order_id,
             replacement,
             options,
-        ) {
+            Some(client_id),
+        );
+        if let Err(reason) = preflight {
             return Ok(vec![self.reject(
                 client_id,
                 request_id,
@@ -821,7 +837,7 @@ impl SimulatedExchange {
             .engines
             .get_mut(&old_record.symbol)
             .expect("order symbol has a matching engine")
-            .replace_with_options(
+            .replace_with_options_for_client(
                 old_record.exchange_order_id,
                 OrderRequest {
                     order_id: exchange_order_id,
@@ -830,6 +846,7 @@ impl SimulatedExchange {
                     quantity_lots,
                 },
                 options,
+                Some(client_id),
             );
         if let Some(reason) = replaced.rejection {
             return Ok(vec![self.reject(
@@ -848,7 +865,7 @@ impl SimulatedExchange {
         let mut old_record = old_record;
         old_record.status = OrderStatus::Cancelled;
         self.orders.insert(old_key, old_record.clone());
-        self.live_orders.remove(&old_record.exchange_order_id);
+        self.remove_live_order(old_record.exchange_order_id);
         reports.push(self.report(
             client_id,
             request_id,
@@ -897,6 +914,7 @@ impl SimulatedExchange {
             replaced.replacement.resting_quantity_lots,
             replaced.replacement.sequence,
             options.time_in_force,
+            replaced.replacement.self_trade_prevented,
         )?);
         Ok(reports)
     }
@@ -915,6 +933,7 @@ impl SimulatedExchange {
         resting_quantity: u64,
         engine_sequence: Option<u64>,
         time_in_force: TimeInForce,
+        self_trade_prevented: bool,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
         let mut reports = Vec::with_capacity(trades.len().saturating_mul(2).max(1));
         let had_trades = !trades.is_empty();
@@ -936,7 +955,7 @@ impl SimulatedExchange {
             };
             self.orders.insert(maker_key, maker.clone());
             if maker_leaves == 0 {
-                self.live_orders.remove(&trade.maker_order_id);
+                self.remove_live_order(trade.maker_order_id);
             }
             reports.push(self.report(
                 maker_key.client_id,
@@ -996,16 +1015,16 @@ impl SimulatedExchange {
                 Some(taker_price),
                 taker_quantity,
                 0,
-                resting_quantity,
+                taker_quantity,
                 0,
                 None,
                 None,
             ));
         }
         if resting_quantity > 0 {
-            self.live_orders.insert(taker_exchange_id, taker_key);
+            self.insert_live_order(taker_exchange_id, taker_key);
         }
-        if time_in_force == TimeInForce::Ioc {
+        if self_trade_prevented || time_in_force == TimeInForce::Ioc {
             let mut taker = self.orders[&taker_key].clone();
             if taker.cumulative_quantity_lots < taker.order_quantity_lots {
                 taker.status = OrderStatus::Cancelled;
@@ -1411,6 +1430,96 @@ mod tests {
     }
 
     #[test]
+    fn self_trade_cancels_incoming_and_preserves_resting_order() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(7, 1, new_order(1, Side::Sell, 100, 4)))
+            .unwrap();
+        let own_order = exchange.book_orders();
+        let response = exchange
+            .handle(request(7, 2, new_order(2, Side::Buy, 100, 3)))
+            .unwrap();
+
+        assert_eq!(response.reports.len(), 2);
+        assert_eq!(response.reports[0].status, OrderStatus::Accepted);
+        assert_eq!(response.reports[1].status, OrderStatus::Cancelled);
+        assert!(response
+            .reports
+            .iter()
+            .all(|report| report.last_quantity_lots == 0));
+        assert_eq!(exchange.book_orders(), own_order);
+        assert_eq!(exchange.live_order_count(), 1);
+        exchange.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn self_trade_stops_fifo_walk_after_external_fill() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(7, 1, new_order(1, Side::Sell, 101, 4)))
+            .unwrap();
+        exchange
+            .handle(request(8, 1, new_order(1, Side::Sell, 100, 2)))
+            .unwrap();
+        let own_order = exchange
+            .book_orders()
+            .into_iter()
+            .find(|order| order.client_id == 7)
+            .unwrap();
+        let response = exchange
+            .handle(request(7, 2, new_order(2, Side::Buy, 101, 5)))
+            .unwrap();
+
+        assert_eq!(response.reports.len(), 3);
+        assert_eq!(response.reports[0].client_id, 8);
+        assert_eq!(response.reports[0].status, OrderStatus::Filled);
+        assert_eq!(response.reports[1].status, OrderStatus::PartiallyFilled);
+        assert_eq!(response.reports[1].last_quantity_lots, 2);
+        assert_eq!(response.reports[2].status, OrderStatus::Cancelled);
+        assert_eq!(response.reports[2].leaves_quantity_lots, 0);
+        let remaining_own_order = exchange
+            .book_orders()
+            .into_iter()
+            .find(|order| order.client_id == 7)
+            .unwrap();
+        assert_eq!(remaining_own_order, own_order);
+        assert_eq!(exchange.live_order_count(), 1);
+        exchange.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn fok_does_not_count_external_liquidity_behind_a_self_order() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(7, 1, new_order(1, Side::Sell, 100, 2)))
+            .unwrap();
+        exchange
+            .handle(request(8, 1, new_order(1, Side::Sell, 100, 2)))
+            .unwrap();
+        let before = exchange.book_orders();
+        let response = exchange
+            .handle(request(
+                7,
+                2,
+                new_order_with_options(2, Side::Buy, 100, 1, TimeInForce::Fok, false),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            response.reports[0].reject_reason,
+            Some(GatewayRejectReason::Engine(
+                RejectReason::FillOrKillUnavailable
+            ))
+        );
+        assert_eq!(exchange.book_orders(), before);
+        let accepted = exchange
+            .handle(request(9, 1, new_order(1, Side::Buy, 90, 1)))
+            .unwrap();
+        assert_eq!(accepted.reports[0].exchange_order_id, Some(3));
+        exchange.check_invariants().unwrap();
+    }
+
+    #[test]
     fn partial_fills_then_cancel_reconcile_cumulative_and_leaves() {
         let mut exchange = SimulatedExchange::default();
         let ask = exchange
@@ -1622,11 +1731,20 @@ mod tests {
             for report in response.reports {
                 assert!(report.report_sequence > last_report_sequence);
                 last_report_sequence = report.report_sequence;
-                if report.status != OrderStatus::Rejected {
-                    assert_eq!(
+                match report.status {
+                    OrderStatus::Accepted | OrderStatus::PartiallyFilled => assert_eq!(
                         report.cumulative_quantity_lots + report.leaves_quantity_lots,
                         report.order_quantity_lots
-                    );
+                    ),
+                    OrderStatus::Filled => {
+                        assert_eq!(report.cumulative_quantity_lots, report.order_quantity_lots);
+                        assert_eq!(report.leaves_quantity_lots, 0);
+                    }
+                    OrderStatus::Cancelled => {
+                        assert!(report.cumulative_quantity_lots <= report.order_quantity_lots);
+                        assert_eq!(report.leaves_quantity_lots, 0);
+                    }
+                    OrderStatus::Rejected => {}
                 }
             }
             exchange

@@ -22,6 +22,7 @@ use std::path::PathBuf;
 struct ReferenceMatcher {
     resting: Vec<RestingOrder>,
     used_order_ids: HashSet<u64>,
+    owners: HashMap<u64, u64>,
     next_sequence: Sequence,
 }
 
@@ -30,6 +31,7 @@ impl ReferenceMatcher {
         &self,
         request: OrderRequest,
         options: OrderOptions,
+        owner_id: Option<u64>,
     ) -> Result<(), RejectReason> {
         if request.price_ticks <= 0 {
             return Err(RejectReason::InvalidPrice);
@@ -53,16 +55,28 @@ impl ReferenceMatcher {
         if options.post_only && self.resting.iter().find(eligible).is_some() {
             return Err(RejectReason::PostOnlyWouldTake);
         }
-        let available = self
-            .resting
-            .iter()
-            .filter(eligible)
-            .map(|order| u128::from(order.remaining_lots))
-            .fold(0_u128, u128::saturating_add);
-        if options.time_in_force == TimeInForce::Fok
-            && available < u128::from(request.quantity_lots)
-        {
-            return Err(RejectReason::FillOrKillUnavailable);
+        if options.time_in_force == TimeInForce::Fok {
+            let mut eligible_orders: Vec<_> = self.resting.iter().filter(eligible).collect();
+            eligible_orders.sort_by(|left, right| match request.side {
+                Side::Buy => left
+                    .price_ticks
+                    .cmp(&right.price_ticks)
+                    .then(left.sequence.cmp(&right.sequence)),
+                Side::Sell => right
+                    .price_ticks
+                    .cmp(&left.price_ticks)
+                    .then(left.sequence.cmp(&right.sequence)),
+            });
+            let mut available = 0_u128;
+            for order in eligible_orders {
+                if owner_id.is_some() && self.owners.get(&order.order_id).copied() == owner_id {
+                    break;
+                }
+                available = available.saturating_add(u128::from(order.remaining_lots));
+            }
+            if available < u128::from(request.quantity_lots) {
+                return Err(RejectReason::FillOrKillUnavailable);
+            }
         }
         Ok(())
     }
@@ -72,6 +86,7 @@ impl ReferenceMatcher {
         old_id: u64,
         replacement: OrderRequest,
         options: OrderOptions,
+        owner_id: Option<u64>,
     ) -> Result<(), RejectReason> {
         if !self.resting.iter().any(|order| order.order_id == old_id) {
             return Err(RejectReason::UnknownOrderId);
@@ -79,15 +94,16 @@ impl ReferenceMatcher {
         if self.next_sequence >= Sequence::MAX - 1 {
             return Err(RejectReason::SequenceExhausted);
         }
-        self.preflight_order(replacement, options)
+        self.preflight_order(replacement, options, owner_id)
     }
 
-    fn submit_with_options(
+    fn submit_with_options_avoiding(
         &mut self,
         request: OrderRequest,
         options: OrderOptions,
+        owner_id: Option<u64>,
     ) -> SubmitResult {
-        if let Err(reason) = self.preflight_order(request, options) {
+        if let Err(reason) = self.preflight_order(request, options, owner_id) {
             return rejected(reason);
         }
         let sequence = self.next_sequence + 1;
@@ -96,6 +112,7 @@ impl ReferenceMatcher {
 
         let mut remaining = request.quantity_lots;
         let mut trades = Vec::new();
+        let mut self_trade_prevented = false;
         while remaining > 0 {
             let maker_index = self
                 .resting
@@ -122,6 +139,10 @@ impl ReferenceMatcher {
                 .map(|(index, _)| index);
             let Some(index) = maker_index else { break };
             let maker = self.resting[index];
+            if owner_id.is_some() && self.owners.get(&maker.order_id).copied() == owner_id {
+                self_trade_prevented = true;
+                break;
+            }
             let quantity = remaining.min(maker.remaining_lots);
             remaining -= quantity;
             trades.push(Trade {
@@ -134,11 +155,12 @@ impl ReferenceMatcher {
             });
             if quantity == maker.remaining_lots {
                 self.resting.remove(index);
+                self.owners.remove(&maker.order_id);
             } else {
                 self.resting[index].remaining_lots -= quantity;
             }
         }
-        if remaining > 0 && options.time_in_force == TimeInForce::Gtc {
+        if remaining > 0 && options.time_in_force == TimeInForce::Gtc && !self_trade_prevented {
             self.resting.push(RestingOrder {
                 order_id: request.order_id,
                 side: request.side,
@@ -146,15 +168,21 @@ impl ReferenceMatcher {
                 remaining_lots: remaining,
                 sequence,
             });
+            if let Some(owner_id) = owner_id {
+                self.owners.insert(request.order_id, owner_id);
+            }
         }
         SubmitResult {
             sequence: Some(sequence),
             trades,
-            resting_quantity_lots: if options.time_in_force == TimeInForce::Gtc {
+            resting_quantity_lots: if options.time_in_force == TimeInForce::Gtc
+                && !self_trade_prevented
+            {
                 remaining
             } else {
                 0
             },
+            self_trade_prevented,
             rejection: None,
         }
     }
@@ -171,7 +199,9 @@ impl ReferenceMatcher {
             return Err(RejectReason::SequenceExhausted);
         };
         self.next_sequence = sequence;
-        Ok(self.resting.remove(index))
+        let order = self.resting.remove(index);
+        self.owners.remove(&order_id);
+        Ok(order)
     }
 
     fn replace_with_options(
@@ -179,51 +209,9 @@ impl ReferenceMatcher {
         old_id: u64,
         replacement: OrderRequest,
         options: OrderOptions,
+        owner_id: Option<u64>,
     ) -> ReplaceResult {
-        let rejection = if replacement.price_ticks <= 0 {
-            Some(RejectReason::InvalidPrice)
-        } else if replacement.quantity_lots == 0 {
-            Some(RejectReason::InvalidQuantity)
-        } else if self.used_order_ids.contains(&replacement.order_id) {
-            Some(RejectReason::DuplicateOrderId)
-        } else if !self.resting.iter().any(|order| order.order_id == old_id) {
-            Some(RejectReason::UnknownOrderId)
-        } else if self.next_sequence >= Sequence::MAX - 1 {
-            Some(RejectReason::SequenceExhausted)
-        } else if options.post_only && options.time_in_force != TimeInForce::Gtc {
-            Some(RejectReason::InvalidOrderOptions)
-        } else if options.post_only
-            && self.resting.iter().any(|order| match replacement.side {
-                Side::Buy => {
-                    order.side == Side::Sell && order.price_ticks <= replacement.price_ticks
-                }
-                Side::Sell => {
-                    order.side == Side::Buy && order.price_ticks >= replacement.price_ticks
-                }
-            })
-        {
-            Some(RejectReason::PostOnlyWouldTake)
-        } else if options.time_in_force == TimeInForce::Fok
-            && self
-                .resting
-                .iter()
-                .filter(|order| match replacement.side {
-                    Side::Buy => {
-                        order.side == Side::Sell && order.price_ticks <= replacement.price_ticks
-                    }
-                    Side::Sell => {
-                        order.side == Side::Buy && order.price_ticks >= replacement.price_ticks
-                    }
-                })
-                .map(|order| u128::from(order.remaining_lots))
-                .sum::<u128>()
-                < u128::from(replacement.quantity_lots)
-        {
-            Some(RejectReason::FillOrKillUnavailable)
-        } else {
-            None
-        };
-        if let Some(reason) = rejection {
+        if let Err(reason) = self.preflight_replace(old_id, replacement, options, owner_id) {
             return ReplaceResult {
                 cancelled_sequence: None,
                 replacement: rejected(reason.clone()),
@@ -233,7 +221,7 @@ impl ReferenceMatcher {
         self.cancel(old_id)
             .expect("replacement prevalidated old order");
         let cancelled_sequence = Some(self.next_sequence);
-        let result = self.submit_with_options(replacement, options);
+        let result = self.submit_with_options_avoiding(replacement, options, owner_id);
         ReplaceResult {
             cancelled_sequence,
             replacement: result,
@@ -318,6 +306,7 @@ fn rejected(reason: RejectReason) -> SubmitResult {
         sequence: None,
         trades: Vec::new(),
         resting_quantity_lots: 0,
+        self_trade_prevented: false,
         rejection: Some(reason),
     }
 }
@@ -531,7 +520,7 @@ impl ReferenceExchange {
             quantity_lots,
         };
         let matcher = self.engines.entry(symbol.clone()).or_default();
-        if let Err(reason) = matcher.preflight_order(order_request, options) {
+        if let Err(reason) = matcher.preflight_order(order_request, options, Some(client_id)) {
             return Ok(vec![self.reject(
                 client_id,
                 request_id,
@@ -549,7 +538,7 @@ impl ReferenceExchange {
             .engines
             .get_mut(&symbol)
             .expect("matcher inserted above")
-            .submit_with_options(order_request, options);
+            .submit_with_options_avoiding(order_request, options, Some(client_id));
         if let Some(reason) = result.rejection {
             return Ok(vec![self.reject(
                 client_id,
@@ -592,6 +581,7 @@ impl ReferenceExchange {
             result.resting_quantity_lots,
             Some(sequence),
             options.time_in_force,
+            result.self_trade_prevented,
         )
     }
 
@@ -760,6 +750,7 @@ impl ReferenceExchange {
             old.exchange_order_id,
             replacement_request,
             options,
+            Some(client_id),
         ) {
             return Ok(vec![self.reject(
                 client_id,
@@ -787,6 +778,7 @@ impl ReferenceExchange {
                     quantity_lots,
                 },
                 options,
+                Some(client_id),
             );
         if let Some(reason) = replaced.rejection {
             return Ok(vec![self.reject(
@@ -854,6 +846,7 @@ impl ReferenceExchange {
             replaced.replacement.resting_quantity_lots,
             Some(sequence),
             options.time_in_force,
+            replaced.replacement.self_trade_prevented,
         )?);
         Ok(reports)
     }
@@ -872,6 +865,7 @@ impl ReferenceExchange {
         resting_quantity: u64,
         engine_sequence: Option<u64>,
         time_in_force: TimeInForce,
+        self_trade_prevented: bool,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
         let had_trades = !trades.is_empty();
         let mut reports = Vec::with_capacity(trades.len().saturating_mul(2).max(1));
@@ -944,7 +938,7 @@ impl ReferenceExchange {
                 Some(taker_price),
                 taker_quantity,
                 0,
-                resting_quantity,
+                taker_quantity,
                 0,
                 None,
                 None,
@@ -953,7 +947,7 @@ impl ReferenceExchange {
         if resting_quantity > 0 {
             self.live.insert(taker_exchange_id, taker_key);
         }
-        if time_in_force == TimeInForce::Ioc {
+        if self_trade_prevented || time_in_force == TimeInForce::Ioc {
             let mut taker = self.orders[&taker_key].clone();
             if taker.cumulative_lots < taker.quantity_lots {
                 taker.status = OrderStatus::Cancelled;
