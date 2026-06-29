@@ -368,6 +368,41 @@ impl SimulatedExchange {
         states
     }
 
+    /// Look up an order only within the requesting client's namespace.
+    pub fn order_state_for_client(
+        &self,
+        client_id: u64,
+        client_order_id: u64,
+    ) -> Option<OrderStateSnapshot> {
+        let key = ClientOrderKey {
+            client_id,
+            client_order_id,
+        };
+        let record = self.orders.get(&key)?;
+        Some(OrderStateSnapshot {
+            client_id,
+            client_order_id,
+            exchange_order_id: record.exchange_order_id,
+            symbol: record.symbol.clone(),
+            priority_sequence: record.priority_sequence,
+            side: record.side,
+            price_ticks: record.price_ticks,
+            order_quantity_lots: record.order_quantity_lots,
+            cumulative_quantity_lots: record.cumulative_quantity_lots,
+            leaves_quantity_lots: if matches!(
+                record.status,
+                OrderStatus::Accepted | OrderStatus::PartiallyFilled
+            ) {
+                record.order_quantity_lots - record.cumulative_quantity_lots
+            } else {
+                0
+            },
+            status: record.status,
+            time_in_force: record.time_in_force,
+            post_only: record.post_only,
+        })
+    }
+
     pub fn book_orders(&self) -> Vec<OrderStateSnapshot> {
         let mut orders: Vec<_> = self
             .order_states()
