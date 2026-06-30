@@ -1997,6 +1997,20 @@ mod tests {
     }
 
     #[test]
+    fn client_order_lookup_returns_owned_state_only() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(100, 1, new_order(55, Side::Sell, 100, 4)))
+            .unwrap();
+
+        let state = exchange.order_state_for_client(100, 55).unwrap();
+        assert_eq!(state.status, OrderStatus::Accepted);
+        assert_eq!(state.leaves_quantity_lots, 4);
+        assert_eq!(exchange.order_state_for_client(200, 55), None);
+        assert_eq!(exchange.order_state_for_client(100, 56), None);
+    }
+
+    #[test]
     fn concurrent_clients_receive_distinct_fills_with_global_report_sequences() {
         use std::thread;
 
