@@ -72,6 +72,7 @@ pub enum GatewayCommand {
     Cancel {
         client_order_id: u64,
     },
+    CancelAll,
     Replace {
         client_order_id: u64,
         replacement_client_order_id: u64,
@@ -271,6 +272,7 @@ impl SimulatedExchange {
             GatewayCommand::Cancel { client_order_id } => {
                 self.cancel(request.client_id, request.request_id, client_order_id)
             }
+            GatewayCommand::CancelAll => self.cancel_all(request.client_id, request.request_id),
             GatewayCommand::Replace {
                 client_order_id,
                 replacement_client_order_id,
@@ -756,6 +758,23 @@ impl SimulatedExchange {
             None,
             None,
         )]
+    }
+
+    fn cancel_all(&mut self, client_id: u64, request_id: u64) -> Vec<ExecutionReport> {
+        let mut orders: Vec<_> = self
+            .orders
+            .iter()
+            .filter(|(key, record)| {
+                key.client_id == client_id
+                    && self.live_orders.contains_key(&record.exchange_order_id)
+            })
+            .map(|(key, record)| (record.exchange_order_id, key.client_order_id))
+            .collect();
+        orders.sort_unstable();
+        orders
+            .into_iter()
+            .flat_map(|(_, order_id)| self.cancel(client_id, request_id, order_id))
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
