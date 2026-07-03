@@ -2030,6 +2030,43 @@ mod tests {
     }
 
     #[test]
+    fn cancel_all_is_client_scoped_ordered_and_idempotent() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(1, 1, new_order(11, Side::Sell, 101, 1)))
+            .unwrap();
+        exchange
+            .handle(request(2, 1, new_order(21, Side::Sell, 102, 1)))
+            .unwrap();
+        exchange
+            .handle(request(1, 2, new_order(12, Side::Sell, 103, 1)))
+            .unwrap();
+
+        let command = GatewayCommand::CancelAll;
+        let first = exchange.handle(request(1, 3, command.clone())).unwrap();
+        let retry = exchange.handle(request(1, 3, command)).unwrap();
+        assert_eq!(
+            first
+                .reports
+                .iter()
+                .map(|report| report.client_order_id)
+                .collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+        assert!(first
+            .reports
+            .iter()
+            .all(|report| report.status == OrderStatus::Cancelled));
+        assert!(retry.replayed);
+        assert_eq!(retry.reports, first.reports);
+        assert_eq!(exchange.live_order_count(), 1);
+        assert_eq!(
+            exchange.order_state_for_client(2, 21).unwrap().status,
+            OrderStatus::Accepted
+        );
+    }
+
+    #[test]
     fn concurrent_clients_receive_distinct_fills_with_global_report_sequences() {
         use std::thread;
 
