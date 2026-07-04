@@ -1494,7 +1494,7 @@ proptest! {
                 _ => TimeInForce::Gtc,
             };
             let post_only = flags % 4 == 3;
-            let command = match kind % 3 {
+            let command = match kind % 4 {
                 0 => GatewayCommand::New {
                     client_order_id,
                     symbol: if flags & 1 == 0 { "AAPL" } else { "MSFT" }.into(),
@@ -1505,7 +1505,7 @@ proptest! {
                     post_only,
                 },
                 1 => GatewayCommand::Cancel { client_order_id: u64::from(flags % 16) },
-                _ => GatewayCommand::Replace {
+                2 => GatewayCommand::Replace {
                     client_order_id: u64::from(flags % 16),
                     replacement_client_order_id: client_order_id + 1000,
                     price_ticks,
@@ -1513,6 +1513,7 @@ proptest! {
                     time_in_force,
                     post_only,
                 },
+                _ => GatewayCommand::CancelAll,
             };
             let request = GatewayRequest { client_id, request_id: index as u64 + 1, command };
             prop_assert_eq!(production.handle(request.clone()), reference.handle(request));
