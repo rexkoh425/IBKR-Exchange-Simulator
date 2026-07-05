@@ -1829,7 +1829,9 @@ mod tests {
     fn jsonl_requests_support_ioc_and_default_legacy_fields() {
         let input = concat!(
             "{\"client_id\":1,\"request_id\":1,\"command\":{\"type\":\"new\",\"client_order_id\":1,\"side\":\"sell\",\"price_ticks\":100,\"quantity_lots\":2}}\n",
-            "{\"client_id\":2,\"request_id\":1,\"command\":{\"type\":\"new\",\"client_order_id\":2,\"side\":\"buy\",\"price_ticks\":100,\"quantity_lots\":3,\"time_in_force\":\"ioc\"}}\n"
+            "{\"client_id\":2,\"request_id\":1,\"command\":{\"type\":\"new\",\"client_order_id\":2,\"side\":\"buy\",\"price_ticks\":100,\"quantity_lots\":3,\"time_in_force\":\"ioc\"}}\n",
+            "{\"client_id\":3,\"request_id\":1,\"command\":{\"type\":\"new\",\"client_order_id\":3,\"side\":\"sell\",\"price_ticks\":110,\"quantity_lots\":1}}\n",
+            "{\"client_id\":3,\"request_id\":2,\"command\":{\"type\":\"cancel_all\"}}\n"
         );
         let mut output = Vec::new();
         let summary = run_jsonl(input.as_bytes(), &mut output, GatewayConfig::default()).unwrap();
@@ -1839,11 +1841,12 @@ mod tests {
             .map(|line| serde_json::from_slice(line).unwrap())
             .collect();
 
-        assert_eq!(summary.requests, 2);
+        assert_eq!(summary.requests, 4);
         assert_eq!(responses[0].reports[0].status, OrderStatus::Accepted);
         assert_eq!(responses[1].reports.len(), 3);
         assert_eq!(responses[1].reports[2].status, OrderStatus::Cancelled);
         assert_eq!(responses[1].reports[2].leaves_quantity_lots, 0);
+        assert_eq!(responses[3].reports[0].status, OrderStatus::Cancelled);
     }
 
     #[test]
