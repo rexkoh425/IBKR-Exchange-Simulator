@@ -581,6 +581,28 @@ mod tests {
     }
 
     #[test]
+    fn journal_replays_mass_cancel_to_same_client_book() {
+        let mut commands = requests();
+        commands.push(GatewayRequest {
+            client_id: 1,
+            request_id: 3,
+            command: GatewayCommand::CancelAll,
+        });
+        let mut bytes = Vec::new();
+        let mut journal = ExchangeJournal::new(GatewayConfig::default(), &mut bytes);
+        for command in commands {
+            journal.handle(command).unwrap();
+        }
+        let original = journal.summary();
+        drop(journal);
+
+        let recovered = recover(Cursor::new(bytes), GatewayConfig::default()).unwrap();
+        assert_eq!(recovered.summary, original);
+        assert_eq!(recovered.exchange.live_order_count(), 0);
+        assert!(recovered.exchange.check_invariants().is_ok());
+    }
+
+    #[test]
     fn journal_records_protocol_rejections_and_replays_them() {
         let mut bytes = Vec::new();
         let mut journal = ExchangeJournal::new(GatewayConfig::default(), &mut bytes);
