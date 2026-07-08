@@ -6,6 +6,7 @@
 - A successful retry response may include the original reports and sequence numbers, but the journal's execution-event history records those sequence numbers once.
 - A client order ID is scoped to its client and cannot be reused during the exchange lifetime, even after its order is filled or cancelled.
 - Only the owning client may cancel or replace an order. A cancel or replace of an unknown, terminal, or foreign order is rejected without changing the book.
+- `cancel_all` affects only live orders owned by the requesting client. It emits ordinary cancel reports in ascending exchange-order ID order; an empty selection returns no reports. The request is idempotent like other commands.
 
 ## Limit orders and priority
 
