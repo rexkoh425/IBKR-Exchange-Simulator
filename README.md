@@ -79,6 +79,7 @@ flowchart LR
 - Best price trades first; equal-price orders execute FIFO at the resting maker's price.
 - Cancel removes remaining quantity. Replace is cancel-and-new, so it loses time priority; a rejected replacement leaves the original order live.
 - Request IDs are scoped by client. Identical retries return cached reports; reuse with different content is rejected. Cancels and replacements enforce ownership.
+- Client-scoped order lookup exposes current lifecycle state. `cancel_all` cancels that client's live orders in deterministic exchange-ID order and leaves other clients untouched.
 - GTC rests any unfilled remainder. IOC cancels the remainder. FOK rejects atomically when visible eligible quantity is insufficient. Post-only rejects a crossing order.
 - Self-trade prevention stops before the next same-client maker, keeps that resting order unchanged, and cancels the incoming remainder. External fills earlier in the FIFO walk remain valid.
 - Quantity and notional limits are configurable. Execution reports carry a deterministic global sequence and are associated with the relevant client.
