@@ -74,7 +74,7 @@ This ledger records decisions that constrain implementation. Revisit a decision 
 
 ## DEC-011 â€” Self-trade prevention cancels the incoming remainder
 
-- **Status:** Accepted policy; implementation pending
+- **Status:** Accepted and implemented in matcher and in-process gateway (`81bab16`)
 - **Decision:** Stop the incoming order before its next eligible maker if both orders belong to the same client. Keep the resting order and cancel any incoming remainder; external fills completed earlier in the price/FIFO walk remain valid.
 - **Reason:** This deterministic policy avoids internal self-fills while preserving the resting order's priority and making no unsupported venue-specific compliance claim.
-- **Consequence:** FOK availability excludes same-client orders. The self-trade guard is evaluated at the same serialized matching point as preflight/commit. The incoming exchange order ID and engine sequence are allocated only if the order passes policy preflight; an encountered self order after matching begins cancels the remainder.
+- **Consequence:** FOK availability stops at the first same-client maker. An otherwise valid incoming order allocates its ID and sequence before matching; if it reaches a self maker, it cancels the remainder while preserving earlier external fills and the resting self order.
