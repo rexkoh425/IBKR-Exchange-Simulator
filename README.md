@@ -42,7 +42,7 @@ The matcher result supports the synthetic matching-only target of more than 5M c
 ### Benchmark evidence
 
 - [Exchange, journal, and replay report](benchmarks/exchange-gateway-benchmark-2026-11-10.md) and [raw trials](benchmarks/exchange-gateway-benchmark-2026-11-10.csv)
-- [Self-trade-prevention gateway trials](benchmarks/exchange-stp-gateway-2026-11-10.csv)
+- [Self-trade-prevention gateway report](benchmarks/exchange-stp-gateway-2026-11-10.md) and [raw trials](benchmarks/exchange-stp-gateway-2026-11-10.csv)
 - [Journal checkpoint scaling report](benchmarks/journal-v2-scaling-2026-11-10.md)
 - [Pinned 10M matcher rerun](benchmarks/matcher-10m-pinned-rerun-2026-11-10.csv) and [earlier matcher report](benchmarks/matcher-10m-2026-11-09.md)
 - [Pinned SPSC queue report](benchmarks/pinned-spsc-10m-2026-11-09.md)
