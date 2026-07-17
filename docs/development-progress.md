@@ -6,22 +6,22 @@ Last audited: 2026-11-10. Current local branch: `codex/exchange-simulator-roadma
 
 "Actual program commits" counts only commits created for this roadmap, not historical project work. Existing evidence is cited separately so completed features are not repeated.
 
-Current total: **9 program commits**: `f6e88d1`, `c5437fe`, `b59426a`, `176c675`, `c07de0e`, `6866750`, `fab4ef9`, `29a7dd6`, plus this substantive self-trade policy decision.
+Current total: **26 program commits** (25 preceding commits plus this progress record). The recorded commits are `f6e88d1`, `c5437fe`, `b59426a`, `176c675`, `c07de0e`, `6866750`, `fab4ef9`, `29a7dd6`, `f3b58b6`, `a197864`, `81bab16`, `309eb0a`, `6f7b3c3`, `df198f5`, `d403e92`, `746df11`, `6eb6d6d`, `74feb5d`, `169d8f5`, `874e049`, `b53ec85`, `55e33d7`, `3d9ff43`, `9c93189`, and `da3bffc`.
 
 | Milestone | Planned | Actual program commits | Status | Existing evidence / verification |
 | --- | ---: | ---: | --- | --- |
 | Exchange specification and architecture | 12 | 1 | Complete | `f6e88d1` adds the audited roadmap, architecture/boundary decisions and behavior specification. |
-| Advanced order handling | 14 | 5 | In progress | `c07de0e`, `6866750`, and `fab4ef9` specify and implement GTC/IOC/FOK/post-only end to end. DEC-011 now selects cancel-incoming STP; STP, expiry and session code remains. |
+| Advanced order handling | 14 | 9 | In progress | GTC/IOC/FOK/post-only, cancel-incoming STP, client-scoped state lookup and deterministic client mass cancel are implemented. Session boundaries and expiry remain. |
 | Pre-trade risk controls | 12 | 0 | Partial | Per-order quantity/notional limits exist; client exposure, positions, rate controls and kill switches are missing. |
-| Advanced correctness verification | 12 | 0 | Partial baseline exists | `src/reference_matcher.rs`: 100K deterministic commands across five seeds plus proptest; broaden when new semantics land. |
+| Advanced correctness verification | 12 | 5 | In progress | Reference model and generated tests now include mass cancel; 100K-command/five-seed comparison and proptest passed. |
 | High-performance journaling | 14 | 3 | In progress | `c5437fe` adds v2 periodic checkpoints, v1 recovery/resume, configurable flush batches and replay outcome verification. `b59426a` retains five-trial scaling artifacts; `176c675` documents the policy. Incremental state hashing remains future work. |
 | Client sessions and sequencing | 12 | 0 | Partial | Client-scoped request idempotency/ownership and mutex serialization exist; no session lifecycle or cancel-on-disconnect. Racing lock acquisition order is not repeatable across independent runs. |
 | Exchange market-data publishing | 14 | 0 | Not started | Provider-neutral IBKR market replay exists; simulated-book publisher/subscriptions are absent. |
 | IBKR capture reliability | 10 | 0 | Partial | Read-only L1/L2 capture, disconnect/gap markers and depth reset handling exist; reconnect/resubscription completeness is not established. |
 | Network order gateway | 14 | 0 | Not started | Current gateway is in-process JSONL; no TCP/FIX transport. |
-| Low-latency optimization | 12 | 0 | Partial baseline exists | Pinned matcher and SPSC/multi-stage benchmarks exist. Journal fingerprinting is a known hot spot; no unmeasured speedup claims. |
+| Low-latency optimization | 12 | 2 | Partial baseline exists | Pinned matcher/SPSC benchmarks plus retained paired STP gateway trials; STP measured a small gateway regression, not an optimization. |
 | Deterministic paper trading | 12 | 0 | Not started | No strategy/accounting simulator. |
-| CI, docs and release quality | 12 | 0 | Partial | README, specs and artifacts exist; no `.github` CI workflow was found in the repository audit. |
+| CI, docs and release quality | 12 | 6 | Partial | Recruiter-oriented README, order semantics, roadmap and benchmark reports updated; no `.github` CI workflow was found in the repository audit. |
 
 ## Batch log
 
@@ -56,9 +56,11 @@ Current total: **9 program commits**: `f6e88d1`, `c5437fe`, `b59426a`, `176c675`
 ### Batch 3 — Self-trade prevention policy
 
 - **Date:** 2026-11-10
-- **Tasks:** selected and documented cancel-incoming-remainder semantics, including interaction with price/FIFO, partial external fills, FOK preflight and replacement.
-- **Commits:** this policy/specification commit; implementation is next and this batch remains in progress.
-- **Acceptance:** next slice must compare both matchers after each command, prove no own fill and prove resting self order is unchanged.
+- **Tasks:** implemented cancel-incoming-remainder STP in production and independent reference matchers. Added client-scoped order lookup and a `cancel_all` JSONL command with deterministic exchange-ID report ordering, ownership isolation and request idempotency. Journal recovery reproduces the resulting state.
+- **Commits:** `81bab16` STP implementation; `309eb0a`/`6f7b3c3` order lookup and test; `df198f5`/`d403e92` mass-cancel implementation and test; `746df11` randomized oracle coverage; `6eb6d6d` JSONL test; `74feb5d` journal recovery test. `3d9ff43`/`9c93189` retain and explain paired gateway trials.
+- **Verification:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (66 passed), `cargo build --release`, proptest, and the 100K-command/five-seed reference comparison passed. No differential mismatches.
+- **Performance:** five pinned 10K-request gateway trials measured 508.6k requests/s median and 5.0 us p99, with zero mismatches. Against the same-workload pre-STP run, throughput was 5.1% lower and p99 6.4% higher. This STP cost is recorded without a speedup claim.
+- **Next:** finish ORD-03 session boundaries, then implement deterministic order expiry; keep each tested code or evidence slice small and locally committed.
 
 ## Current risks and blockers
 
@@ -66,4 +68,4 @@ Current total: **9 program commits**: `f6e88d1`, `c5437fe`, `b59426a`, `176c675`
 - Benchmark CPU time and peak working set have only been sampled process-wide, not independently attributed to every exchange stage.
 - Concurrent requests are serialized, but mutex acquisition is scheduler-dependent; deterministic replay requires recording the observed serialized order.
 - No live IBKR connection or live trading has been verified. Keep those claims separate from fixture/synthetic verification.
-- Advanced orders currently support GTC/IOC/FOK/post-only only. STP, mass cancellation, session boundaries, expiration and status query commands remain unimplemented.
+- Advanced orders include GTC/IOC/FOK/post-only and STP. Client-scoped lookup and mass cancel are implemented; exchange sessions and order expiration remain future work.
