@@ -18,6 +18,7 @@ pub mod market_benchmark;
 pub mod market_data;
 pub mod pipeline;
 pub mod replay;
+pub mod session;
 
 #[cfg(test)]
 mod reference_matcher;
