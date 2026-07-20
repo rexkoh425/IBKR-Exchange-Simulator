@@ -5,6 +5,7 @@
 //! lifetime. Replace requests cancel the old order and submit a fresh order,
 //! so they do not inherit time priority.
 
+use crate::session::SessionState;
 use crate::{MatchingEngine, OrderOptions, OrderRequest, RejectReason, Side, TimeInForce, Trade};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -199,6 +200,7 @@ struct CachedRequest {
 #[derive(Debug)]
 pub struct SimulatedExchange {
     config: GatewayConfig,
+    session: SessionState,
     engines: HashMap<String, MatchingEngine>,
     next_exchange_order_id: u64,
     next_report_sequence: u128,
@@ -218,6 +220,7 @@ impl SimulatedExchange {
     pub fn new(config: GatewayConfig) -> Self {
         Self {
             config,
+            session: SessionState::Open,
             engines: HashMap::new(),
             next_exchange_order_id: 0,
             next_report_sequence: 0,
@@ -329,6 +332,10 @@ impl SimulatedExchange {
             .values()
             .map(MatchingEngine::live_order_count)
             .sum()
+    }
+
+    pub fn session_state(&self) -> SessionState {
+        self.session
     }
 
     fn insert_live_order(&mut self, exchange_id: u64, key: ClientOrderKey) {
@@ -542,6 +549,9 @@ impl SimulatedExchange {
                 let bytes = serde_json::to_vec(report).expect("report serialization");
                 add(&mut hash, &bytes);
             }
+        }
+        if self.session == SessionState::Closed {
+            add(&mut hash, b"session:closed");
         }
         hash
     }
@@ -2030,6 +2040,17 @@ mod tests {
         assert_eq!(state.leaves_quantity_lots, 4);
         assert_eq!(exchange.order_state_for_client(200, 55), None);
         assert_eq!(exchange.order_state_for_client(100, 56), None);
+    }
+
+    #[test]
+    fn closed_session_changes_the_exchange_fingerprint() {
+        let mut exchange = SimulatedExchange::default();
+        let open_fingerprint = exchange.state_fingerprint();
+        assert_eq!(exchange.session_state(), SessionState::Open);
+        exchange.session = SessionState::Closed;
+        assert_ne!(exchange.state_fingerprint(), open_fingerprint);
+        exchange.session = SessionState::Open;
+        assert_eq!(exchange.state_fingerprint(), open_fingerprint);
     }
 
     #[test]

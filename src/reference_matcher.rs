@@ -341,6 +341,7 @@ struct ReferenceCache {
 #[derive(Debug)]
 struct ReferenceExchange {
     config: GatewayConfig,
+    session: crate::session::SessionState,
     engines: HashMap<String, ReferenceMatcher>,
     next_exchange_id: u64,
     next_report_sequence: u128,
@@ -354,6 +355,7 @@ impl ReferenceExchange {
     fn new(config: GatewayConfig) -> Self {
         Self {
             config,
+            session: crate::session::SessionState::Open,
             engines: HashMap::new(),
             next_exchange_id: 0,
             next_report_sequence: 0,
@@ -1211,6 +1213,9 @@ impl ReferenceExchange {
             for report in &entry.reports {
                 add(&mut hash, &serde_json::to_vec(report).unwrap());
             }
+        }
+        if self.session == crate::session::SessionState::Closed {
+            add(&mut hash, b"session:closed");
         }
         hash
     }
