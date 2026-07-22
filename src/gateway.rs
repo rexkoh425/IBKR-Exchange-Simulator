@@ -74,6 +74,9 @@ pub enum GatewayCommand {
         client_order_id: u64,
     },
     CancelAll,
+    SetSession {
+        state: SessionState,
+    },
     Replace {
         client_order_id: u64,
         replacement_client_order_id: u64,
@@ -149,6 +152,7 @@ pub enum GatewayOutcome {
 pub enum GatewayError {
     InvalidRequestId,
     IdempotencyConflict,
+    UnauthorizedSessionControl,
     ExchangeOrderIdExhausted,
     LockPoisoned,
 }
@@ -159,6 +163,9 @@ impl std::fmt::Display for GatewayError {
             Self::InvalidRequestId => formatter.write_str("request_id must be greater than zero"),
             Self::IdempotencyConflict => {
                 formatter.write_str("request_id was already used for a different command")
+            }
+            Self::UnauthorizedSessionControl => {
+                formatter.write_str("only control client 0 may change the session")
             }
             Self::ExchangeOrderIdExhausted => {
                 formatter.write_str("simulated exchange order ID space is exhausted")
@@ -276,6 +283,13 @@ impl SimulatedExchange {
                 self.cancel(request.client_id, request.request_id, client_order_id)
             }
             GatewayCommand::CancelAll => self.cancel_all(request.client_id, request.request_id),
+            GatewayCommand::SetSession { state } => {
+                if request.client_id != 0 {
+                    return Err(GatewayError::UnauthorizedSessionControl);
+                }
+                self.session = state;
+                Vec::new()
+            }
             GatewayCommand::Replace {
                 client_order_id,
                 replacement_client_order_id,
@@ -2051,6 +2065,33 @@ mod tests {
         assert_ne!(exchange.state_fingerprint(), open_fingerprint);
         exchange.session = SessionState::Open;
         assert_eq!(exchange.state_fingerprint(), open_fingerprint);
+    }
+
+    #[test]
+    fn session_control_requires_control_client_and_retries_do_not_reapply() {
+        let mut exchange = SimulatedExchange::default();
+        let close = GatewayCommand::SetSession {
+            state: SessionState::Closed,
+        };
+        assert_eq!(
+            exchange.handle(request(1, 1, close.clone())),
+            Err(GatewayError::UnauthorizedSessionControl)
+        );
+        assert_eq!(exchange.session_state(), SessionState::Open);
+        let first = exchange.handle(request(0, 1, close.clone())).unwrap();
+        assert!(first.reports.is_empty());
+        assert_eq!(exchange.session_state(), SessionState::Closed);
+        exchange
+            .handle(request(
+                0,
+                2,
+                GatewayCommand::SetSession {
+                    state: SessionState::Open,
+                },
+            ))
+            .unwrap();
+        assert!(exchange.handle(request(0, 1, close)).unwrap().replayed);
+        assert_eq!(exchange.session_state(), SessionState::Open);
     }
 
     #[test]

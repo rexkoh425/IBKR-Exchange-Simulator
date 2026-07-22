@@ -408,6 +408,13 @@ impl ReferenceExchange {
                 Ok(self.cancel(request.client_id, request.request_id, client_order_id))
             }
             GatewayCommand::CancelAll => Ok(self.cancel_all(request.client_id, request.request_id)),
+            GatewayCommand::SetSession { state } => {
+                if request.client_id != 0 {
+                    return Err(GatewayError::UnauthorizedSessionControl);
+                }
+                self.session = state;
+                Ok(Vec::new())
+            }
             GatewayCommand::Replace {
                 client_order_id,
                 replacement_client_order_id,
@@ -1290,6 +1297,7 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
                     client_order_id: client_order_id ^ (1 << 63),
                 },
                 GatewayCommand::CancelAll => GatewayCommand::CancelAll,
+                GatewayCommand::SetSession { state } => GatewayCommand::SetSession { state },
                 GatewayCommand::Replace {
                     client_order_id,
                     replacement_client_order_id,
