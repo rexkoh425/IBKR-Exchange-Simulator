@@ -462,6 +462,19 @@ impl ReferenceExchange {
         quantity_lots: u64,
         options: OrderOptions,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
+        if !self.session.allows_new_orders() {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                None,
+                None,
+                Some(side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::SessionClosed,
+            )]);
+        }
         let key = ReferenceKey {
             client_id,
             client_order_id,

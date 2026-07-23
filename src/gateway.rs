@@ -102,6 +102,7 @@ pub enum OrderStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "detail", rename_all = "snake_case")]
 pub enum GatewayRejectReason {
+    SessionClosed,
     InvalidSymbol,
     InvalidClientOrderId,
     DuplicateClientOrderId,
@@ -582,6 +583,18 @@ impl SimulatedExchange {
         quantity_lots: u64,
         options: OrderOptions,
     ) -> Result<Vec<ExecutionReport>, GatewayError> {
+        if !self.session.allows_new_orders() {
+            return Ok(vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                None,
+                Some(side),
+                Some(price_ticks),
+                quantity_lots,
+                GatewayRejectReason::SessionClosed,
+            )]);
+        }
         let key = ClientOrderKey {
             client_id,
             client_order_id,
