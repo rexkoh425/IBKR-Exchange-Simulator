@@ -2108,6 +2108,43 @@ mod tests {
     }
 
     #[test]
+    fn closed_session_rejects_new_order_without_reserving_its_id() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(
+                0,
+                1,
+                GatewayCommand::SetSession {
+                    state: SessionState::Closed,
+                },
+            ))
+            .unwrap();
+        let rejected = exchange
+            .handle(request(7, 1, new_order(44, Side::Buy, 100, 2)))
+            .unwrap();
+        assert_eq!(
+            rejected.reports[0].reject_reason,
+            Some(GatewayRejectReason::SessionClosed)
+        );
+        assert!(exchange.order_states().is_empty());
+        exchange
+            .handle(request(
+                0,
+                2,
+                GatewayCommand::SetSession {
+                    state: SessionState::Open,
+                },
+            ))
+            .unwrap();
+        let accepted = exchange
+            .handle(request(7, 2, new_order(44, Side::Buy, 100, 2)))
+            .unwrap();
+        assert_eq!(accepted.reports[0].status, OrderStatus::Accepted);
+        assert_eq!(accepted.reports[0].exchange_order_id, Some(1));
+        assert_eq!(accepted.reports[0].engine_sequence, Some(1));
+    }
+
+    #[test]
     fn cancel_all_is_client_scoped_ordered_and_idempotent() {
         let mut exchange = SimulatedExchange::default();
         exchange
