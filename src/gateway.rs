@@ -2157,6 +2157,51 @@ mod tests {
     }
 
     #[test]
+    fn closed_replacement_preserves_order_and_replacement_id() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(7, 1, new_order(1, Side::Buy, 100, 2)))
+            .unwrap();
+        let before = exchange.book_orders();
+        exchange
+            .handle(request(
+                0,
+                1,
+                GatewayCommand::SetSession {
+                    state: SessionState::Closed,
+                },
+            ))
+            .unwrap();
+        let replace = GatewayCommand::Replace {
+            client_order_id: 1,
+            replacement_client_order_id: 2,
+            price_ticks: 101,
+            quantity_lots: 2,
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
+        };
+        let rejected = exchange.handle(request(7, 2, replace.clone())).unwrap();
+        assert_eq!(
+            rejected.reports[0].reject_reason,
+            Some(GatewayRejectReason::SessionClosed)
+        );
+        assert_eq!(exchange.book_orders(), before);
+        exchange
+            .handle(request(
+                0,
+                2,
+                GatewayCommand::SetSession {
+                    state: SessionState::Open,
+                },
+            ))
+            .unwrap();
+        let accepted = exchange.handle(request(7, 3, replace)).unwrap();
+        assert_eq!(accepted.reports[0].status, OrderStatus::Cancelled);
+        assert_eq!(accepted.reports[1].exchange_order_id, Some(2));
+        assert_eq!(accepted.reports[1].status, OrderStatus::Accepted);
+    }
+
+    #[test]
     fn cancel_all_is_client_scoped_ordered_and_idempotent() {
         let mut exchange = SimulatedExchange::default();
         exchange
