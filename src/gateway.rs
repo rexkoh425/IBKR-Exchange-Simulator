@@ -2202,6 +2202,44 @@ mod tests {
     }
 
     #[test]
+    fn closed_session_allows_cancels_and_preserves_fifo_on_reopen() {
+        let mut exchange = SimulatedExchange::default();
+        for client in 1..=3 {
+            exchange
+                .handle(request(client, 1, new_order(1, Side::Buy, 100, 1)))
+                .unwrap();
+        }
+        exchange
+            .handle(request(
+                0,
+                1,
+                GatewayCommand::SetSession {
+                    state: SessionState::Closed,
+                },
+            ))
+            .unwrap();
+        let cancelled = exchange
+            .handle(request(3, 2, GatewayCommand::CancelAll))
+            .unwrap();
+        assert_eq!(cancelled.reports[0].status, OrderStatus::Cancelled);
+        exchange
+            .handle(request(
+                0,
+                2,
+                GatewayCommand::SetSession {
+                    state: SessionState::Open,
+                },
+            ))
+            .unwrap();
+        let fill = exchange
+            .handle(request(4, 1, new_order(1, Side::Sell, 100, 2)))
+            .unwrap();
+        assert_eq!(fill.reports[0].client_id, 1);
+        assert_eq!(fill.reports[2].client_id, 2);
+        assert_eq!(exchange.live_order_count(), 0);
+    }
+
+    #[test]
     fn cancel_all_is_client_scoped_ordered_and_idempotent() {
         let mut exchange = SimulatedExchange::default();
         exchange
