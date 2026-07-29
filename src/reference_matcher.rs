@@ -1322,8 +1322,14 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
                 GatewayCommand::Cancel { client_order_id } => GatewayCommand::Cancel {
                     client_order_id: client_order_id ^ (1 << 63),
                 },
-                GatewayCommand::CancelAll => GatewayCommand::CancelAll,
-                GatewayCommand::SetSession { state } => GatewayCommand::SetSession { state },
+                GatewayCommand::CancelAll => GatewayCommand::Cancel { client_order_id: 0 },
+                GatewayCommand::SetSession { state } => GatewayCommand::SetSession {
+                    state: if state == crate::session::SessionState::Open {
+                        crate::session::SessionState::Closed
+                    } else {
+                        crate::session::SessionState::Open
+                    },
+                },
                 GatewayCommand::Replace {
                     client_order_id,
                     replacement_client_order_id,
@@ -1533,7 +1539,7 @@ proptest! {
                 _ => TimeInForce::Gtc,
             };
             let post_only = flags % 4 == 3;
-            let command = match kind % 4 {
+            let command = match kind % 5 {
                 0 => GatewayCommand::New {
                     client_order_id,
                     symbol: if flags & 1 == 0 { "AAPL" } else { "MSFT" }.into(),
@@ -1552,7 +1558,10 @@ proptest! {
                     time_in_force,
                     post_only,
                 },
-                _ => GatewayCommand::CancelAll,
+                3 => GatewayCommand::CancelAll,
+                _ => GatewayCommand::SetSession {
+                    state: if flags & 4 == 0 { crate::session::SessionState::Open } else { crate::session::SessionState::Closed },
+                },
             };
             let request = GatewayRequest { client_id, request_id: index as u64 + 1, command };
             prop_assert_eq!(production.handle(request.clone()), reference.handle(request));
