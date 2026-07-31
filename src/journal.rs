@@ -603,6 +603,35 @@ mod tests {
     }
 
     #[test]
+    fn journal_restores_closed_session_and_rejects_new_orders() {
+        use crate::session::SessionState;
+
+        let mut bytes = Vec::new();
+        let mut journal = ExchangeJournal::new(GatewayConfig::default(), &mut bytes);
+        journal.handle(requests()[0].clone()).unwrap();
+        journal
+            .handle(GatewayRequest {
+                client_id: 0,
+                request_id: 1,
+                command: GatewayCommand::SetSession {
+                    state: SessionState::Closed,
+                },
+            })
+            .unwrap();
+        let expected = journal.summary();
+        drop(journal);
+        let mut recovered = recover(Cursor::new(bytes), GatewayConfig::default()).unwrap();
+        assert_eq!(recovered.summary, expected);
+        assert_eq!(recovered.exchange.session_state(), SessionState::Closed);
+        let response = recovered.exchange.handle(requests()[1].clone()).unwrap();
+        assert_eq!(
+            response.reports[0].reject_reason,
+            Some(crate::gateway::GatewayRejectReason::SessionClosed)
+        );
+        assert_eq!(recovered.exchange.live_order_count(), 1);
+    }
+
+    #[test]
     fn journal_records_protocol_rejections_and_replays_them() {
         let mut bytes = Vec::new();
         let mut journal = ExchangeJournal::new(GatewayConfig::default(), &mut bytes);
