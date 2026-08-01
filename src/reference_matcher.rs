@@ -1291,7 +1291,7 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
     };
     for _ in 0..count {
         let random = next(&mut state);
-        let client_id = 1 + (random % 8);
+        let client_id = random % 9;
         let history_index = client_id as usize;
         let choice = (random >> 8) % 100;
         if choice < 8 && !history[history_index].is_empty() {
@@ -1392,7 +1392,7 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
             GatewayCommand::Cancel {
                 client_order_id: candidate_id,
             }
-        } else {
+        } else if command_kind < 93 {
             GatewayCommand::Replace {
                 client_order_id: candidate_id,
                 replacement_client_order_id: next(&mut state) % 64,
@@ -1400,6 +1400,16 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
                 quantity_lots: 1 + (next(&mut state) % 12),
                 time_in_force: TimeInForce::Gtc,
                 post_only: false,
+            }
+        } else if command_kind < 96 {
+            GatewayCommand::CancelAll
+        } else {
+            GatewayCommand::SetSession {
+                state: if next(&mut state) & 1 == 0 {
+                    crate::session::SessionState::Open
+                } else {
+                    crate::session::SessionState::Closed
+                },
             }
         };
         let request = GatewayRequest {
