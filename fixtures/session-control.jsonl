@@ -1,0 +1,8 @@
+{"client_id":1,"request_id":1,"command":{"type":"new","client_order_id":11,"symbol":"AAPL","side":"sell","price_ticks":100,"quantity_lots":3}}
+{"client_id":0,"request_id":1,"command":{"type":"set_session","state":"closed"}}
+{"client_id":2,"request_id":1,"command":{"type":"new","client_order_id":21,"symbol":"AAPL","side":"buy","price_ticks":100,"quantity_lots":2}}
+{"client_id":0,"request_id":2,"command":{"type":"set_session","state":"open"}}
+{"client_id":0,"request_id":1,"command":{"type":"set_session","state":"closed"}}
+{"client_id":2,"request_id":2,"command":{"type":"new","client_order_id":21,"symbol":"AAPL","side":"buy","price_ticks":100,"quantity_lots":2}}
+{"client_id":0,"request_id":3,"command":{"type":"set_session","state":"closed"}}
+{"client_id":1,"request_id":2,"command":{"type":"cancel","client_order_id":11}}
