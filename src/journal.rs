@@ -8,6 +8,7 @@ use crate::gateway::{
     ExchangeStateSnapshot, ExecutionReport, GatewayConfig, GatewayOutcome, GatewayRequest,
     OrderStateSnapshot, OrderStatus, SimulatedExchange,
 };
+use crate::session::SessionState;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::time::Instant;
@@ -128,6 +129,8 @@ pub struct JournalSummary {
     pub execution_reports: Vec<ExecutionReport>,
     pub order_states: Vec<OrderStateSnapshot>,
     pub state_checksum: u64,
+    #[serde(default)]
+    pub session: SessionState,
 }
 
 impl JournalSummary {
@@ -140,6 +143,7 @@ impl JournalSummary {
             execution_reports: Vec::new(),
             order_states: Vec::new(),
             state_checksum: 0,
+            session: SessionState::Open,
         }
     }
 
@@ -166,6 +170,7 @@ impl JournalSummary {
     fn finish(&mut self, exchange: &SimulatedExchange) {
         self.order_states = exchange.order_states();
         self.state_checksum = exchange.state_fingerprint();
+        self.session = exchange.session_state();
     }
 
     pub fn rejected_execution_reports(&self) -> usize {
@@ -179,6 +184,7 @@ impl JournalSummary {
         ExchangeStateSnapshot {
             state_fingerprint: self.state_checksum,
             orders: self.order_states.clone(),
+            session: self.session,
         }
     }
 }
@@ -555,6 +561,7 @@ mod tests {
         let original_state = ExchangeStateSnapshot {
             state_fingerprint: journal.exchange().state_fingerprint(),
             orders: journal.exchange().order_states(),
+            session: journal.exchange().session_state(),
         };
         let original_reports: Vec<_> = original_outcomes
             .iter()
@@ -572,6 +579,7 @@ mod tests {
             ExchangeStateSnapshot {
                 state_fingerprint: recovered.exchange.state_fingerprint(),
                 orders: recovered.exchange.order_states(),
+                session: recovered.exchange.session_state(),
             },
             original_state
         );
@@ -619,6 +627,8 @@ mod tests {
             })
             .unwrap();
         let expected = journal.summary();
+        assert_eq!(expected.session, SessionState::Closed);
+        assert_eq!(expected.snapshot().session, SessionState::Closed);
         drop(journal);
         let mut recovered = recover(Cursor::new(bytes), GatewayConfig::default()).unwrap();
         assert_eq!(recovered.summary, expected);
