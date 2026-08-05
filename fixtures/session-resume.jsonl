@@ -1,0 +1,3 @@
+{"client_id":3,"request_id":1,"command":{"type":"new","client_order_id":31,"symbol":"AAPL","side":"buy","price_ticks":99,"quantity_lots":1}}
+{"client_id":0,"request_id":4,"command":{"type":"set_session","state":"open"}}
+{"client_id":3,"request_id":2,"command":{"type":"new","client_order_id":31,"symbol":"AAPL","side":"buy","price_ticks":99,"quantity_lots":1}}
