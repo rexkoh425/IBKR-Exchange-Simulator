@@ -12,7 +12,7 @@ Release build on Windows x86_64 with an AMD Ryzen 9 9900X. The benchmark thread 
 | p50 | 1.3 us | 1.3-1.4 us |
 | p99 | 5.0 us | 4.6-5.5 us |
 | p99.9 | 47.7 us | 37.9-54.0 us |
-| Maximum | 1.061 ms | 0.960-1.218 ms |
+| Maximum | 1.065 ms | 0.960-1.218 ms |
 | Mismatches | 0 | 0 in every trial |
 
 Against the retained same-workload pre-STP gateway trials, median throughput was 536.0k/s and median p99 was 4.7 us. The STP build measured **5.1% lower throughput** and **6.4% higher p99**. This is a measured cost, not an optimization claim. Both workloads were pinned and used the same seed, event count, and machine.
