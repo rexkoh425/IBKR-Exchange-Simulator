@@ -7,6 +7,7 @@
 - A client order ID is scoped to its client and cannot be reused during the exchange lifetime, even after its order is filled or cancelled.
 - Only the owning client may cancel or replace an order. A cancel or replace of an unknown, terminal, or foreign order is rejected without changing the book.
 - `cancel_all` affects only live orders owned by the requesting client. It emits ordinary cancel reports in ascending exchange-order ID order; an empty selection returns no reports. The request is idempotent like other commands.
+- The exchange starts open. Logical control client 0 can set the session open or closed. A closed session rejects new orders and replacements before allocating order IDs; cancels remain available, and resting orders retain their priority. Client IDs are not authenticated. See [session controls](session-controls.md).
 
 ## Limit orders and priority
 
