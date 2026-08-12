@@ -10,6 +10,7 @@ pub type QuantityLots = u64;
 
 pub mod benchmark;
 pub mod eventlog;
+pub mod expiry;
 pub mod gateway;
 pub mod gateway_benchmark;
 pub mod ibkr;
