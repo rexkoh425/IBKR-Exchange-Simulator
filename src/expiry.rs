@@ -41,4 +41,41 @@ impl ExpirySchedule {
             self.by_deadline.remove(&(deadline, order_id));
         }
     }
+
+    pub fn advance(&mut self, now: u64) -> Result<Vec<u64>, ExpiryError> {
+        if now < self.now {
+            return Err(ExpiryError::ClockRegression);
+        }
+        self.now = now;
+        let due: Vec<_> = self
+            .by_deadline
+            .range(..=(now, u64::MAX))
+            .copied()
+            .collect();
+        for (_, order_id) in &due {
+            self.remove(*order_id);
+        }
+        Ok(due.into_iter().map(|(_, order_id)| order_id).collect())
+    }
+
+    pub fn pending(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.by_deadline.iter().copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExpiryError, ExpirySchedule};
+
+    #[test]
+    fn advancing_expires_by_deadline_then_order_id() {
+        let mut schedule = ExpirySchedule::default();
+        schedule.set(9, Some(10)).unwrap();
+        schedule.set(2, Some(10)).unwrap();
+        schedule.set(3, Some(8)).unwrap();
+        assert_eq!(schedule.advance(9).unwrap(), vec![3]);
+        assert_eq!(schedule.advance(10).unwrap(), vec![2, 9]);
+        assert_eq!(schedule.advance(9), Err(ExpiryError::ClockRegression));
+        assert_eq!(schedule.now(), 10);
+    }
 }
