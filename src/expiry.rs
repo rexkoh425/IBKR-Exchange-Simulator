@@ -78,4 +78,21 @@ mod tests {
         assert_eq!(schedule.advance(9), Err(ExpiryError::ClockRegression));
         assert_eq!(schedule.now(), 10);
     }
+
+    #[test]
+    fn invalid_or_replaced_deadlines_do_not_expire_early() {
+        let mut schedule = ExpirySchedule::default();
+        schedule.advance(5).unwrap();
+        schedule.set(7, Some(12)).unwrap();
+        assert_eq!(
+            schedule.set(7, Some(5)),
+            Err(ExpiryError::DeadlineNotFuture)
+        );
+        assert_eq!(schedule.deadline(7), Some(12));
+        schedule.set(7, Some(20)).unwrap();
+        assert!(schedule.advance(12).unwrap().is_empty());
+        schedule.set(7, None).unwrap();
+        assert_eq!(schedule.deadline(7), None);
+        assert!(schedule.advance(20).unwrap().is_empty());
+    }
 }
