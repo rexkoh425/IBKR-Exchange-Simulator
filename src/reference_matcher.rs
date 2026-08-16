@@ -342,6 +342,8 @@ struct ReferenceCache {
 struct ReferenceExchange {
     config: GatewayConfig,
     session: crate::session::SessionState,
+    expiry_clock: u64,
+    expiries: HashMap<u64, u64>,
     engines: HashMap<String, ReferenceMatcher>,
     next_exchange_id: u64,
     next_report_sequence: u128,
@@ -356,6 +358,8 @@ impl ReferenceExchange {
         Self {
             config,
             session: crate::session::SessionState::Open,
+            expiry_clock: 0,
+            expiries: HashMap::new(),
             engines: HashMap::new(),
             next_exchange_id: 0,
             next_report_sequence: 0,
@@ -1249,6 +1253,20 @@ impl ReferenceExchange {
         }
         if self.session == crate::session::SessionState::Closed {
             add(&mut hash, b"session:closed");
+        }
+        if self.expiry_clock != 0 || !self.expiries.is_empty() {
+            add(&mut hash, b"expiry:v1");
+            add(&mut hash, &self.expiry_clock.to_le_bytes());
+            let mut deadlines: Vec<_> = self
+                .expiries
+                .iter()
+                .map(|(&id, &deadline)| (deadline, id))
+                .collect();
+            deadlines.sort_unstable();
+            for (deadline, order_id) in deadlines {
+                add(&mut hash, &deadline.to_le_bytes());
+                add(&mut hash, &order_id.to_le_bytes());
+            }
         }
         hash
     }

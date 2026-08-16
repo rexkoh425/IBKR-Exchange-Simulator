@@ -5,6 +5,7 @@
 //! lifetime. Replace requests cancel the old order and submit a fresh order,
 //! so they do not inherit time priority.
 
+use crate::expiry::ExpirySchedule;
 use crate::session::SessionState;
 use crate::{MatchingEngine, OrderOptions, OrderRequest, RejectReason, Side, TimeInForce, Trade};
 use serde::{Deserialize, Serialize};
@@ -209,6 +210,7 @@ struct CachedRequest {
 pub struct SimulatedExchange {
     config: GatewayConfig,
     session: SessionState,
+    expiry: ExpirySchedule,
     engines: HashMap<String, MatchingEngine>,
     next_exchange_order_id: u64,
     next_report_sequence: u128,
@@ -229,6 +231,7 @@ impl SimulatedExchange {
         Self {
             config,
             session: SessionState::Open,
+            expiry: ExpirySchedule::default(),
             engines: HashMap::new(),
             next_exchange_order_id: 0,
             next_report_sequence: 0,
@@ -351,6 +354,20 @@ impl SimulatedExchange {
 
     pub fn session_state(&self) -> SessionState {
         self.session
+    }
+
+    pub fn logical_time(&self) -> u64 {
+        self.expiry.now()
+    }
+
+    pub fn expiry_for_client(&self, client_id: u64, client_order_id: u64) -> Option<u64> {
+        let key = ClientOrderKey {
+            client_id,
+            client_order_id,
+        };
+        self.orders
+            .get(&key)
+            .and_then(|order| self.expiry.deadline(order.exchange_order_id))
     }
 
     fn insert_live_order(&mut self, exchange_id: u64, key: ClientOrderKey) {
@@ -567,6 +584,14 @@ impl SimulatedExchange {
         }
         if self.session == SessionState::Closed {
             add(&mut hash, b"session:closed");
+        }
+        if self.expiry.now() != 0 || self.expiry.pending().next().is_some() {
+            add(&mut hash, b"expiry:v1");
+            add(&mut hash, &self.expiry.now().to_le_bytes());
+            for (deadline, order_id) in self.expiry.pending() {
+                add(&mut hash, &deadline.to_le_bytes());
+                add(&mut hash, &order_id.to_le_bytes());
+            }
         }
         hash
     }
