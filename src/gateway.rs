@@ -104,6 +104,7 @@ pub enum OrderStatus {
 #[serde(tag = "type", content = "detail", rename_all = "snake_case")]
 pub enum GatewayRejectReason {
     SessionClosed,
+    ExpiryNotFuture,
     InvalidSymbol,
     InvalidClientOrderId,
     DuplicateClientOrderId,

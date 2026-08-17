@@ -675,6 +675,51 @@ impl ReferenceExchange {
         )]
     }
 
+    #[allow(dead_code)]
+    fn set_expiry(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        client_order_id: u64,
+        deadline: Option<u64>,
+    ) -> Vec<ExecutionReport> {
+        let key = ReferenceKey {
+            client_id,
+            client_order_id,
+        };
+        let order = self.orders.get(&key).cloned();
+        let reason = match &order {
+            None => Some(GatewayRejectReason::UnknownClientOrderId),
+            Some(order) if !self.live.contains_key(&order.exchange_order_id) => {
+                Some(GatewayRejectReason::OrderNotLive)
+            }
+            Some(_) if deadline.is_some_and(|value| value <= self.expiry_clock) => {
+                Some(GatewayRejectReason::ExpiryNotFuture)
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            return vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                order.as_ref().map(|order| order.exchange_order_id),
+                None,
+                order.as_ref().map(|order| order.side),
+                order.as_ref().map(|order| order.price_ticks),
+                order.as_ref().map_or(0, |order| order.quantity_lots),
+                reason,
+            )];
+        }
+        let order_id = order.expect("valid order").exchange_order_id;
+        if let Some(deadline) = deadline {
+            self.expiries.insert(order_id, deadline);
+        } else {
+            self.expiries.remove(&order_id);
+        }
+        Vec::new()
+    }
+
     fn cancel_all(&mut self, client_id: u64, request_id: u64) -> Vec<ExecutionReport> {
         let mut orders: Vec<_> = self
             .orders
