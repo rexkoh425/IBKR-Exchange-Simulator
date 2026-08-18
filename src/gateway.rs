@@ -823,6 +823,48 @@ impl SimulatedExchange {
         )]
     }
 
+    #[allow(dead_code)]
+    fn set_expiry(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        client_order_id: u64,
+        deadline: Option<u64>,
+    ) -> Vec<ExecutionReport> {
+        let key = ClientOrderKey {
+            client_id,
+            client_order_id,
+        };
+        let order = self.orders.get(&key).cloned();
+        let reason = match &order {
+            None => Some(GatewayRejectReason::UnknownClientOrderId),
+            Some(order) if !self.live_orders.contains_key(&order.exchange_order_id) => {
+                Some(GatewayRejectReason::OrderNotLive)
+            }
+            Some(_) if deadline.is_some_and(|value| value <= self.expiry.now()) => {
+                Some(GatewayRejectReason::ExpiryNotFuture)
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            return vec![self.reject(
+                client_id,
+                request_id,
+                client_order_id,
+                order.as_ref().map(|order| order.exchange_order_id),
+                order.as_ref().map(|order| order.side),
+                order.as_ref().map(|order| order.price_ticks),
+                order.as_ref().map_or(0, |order| order.order_quantity_lots),
+                reason,
+            )];
+        }
+        let order_id = order.expect("valid order").exchange_order_id;
+        self.expiry
+            .set(order_id, deadline)
+            .expect("deadline validated");
+        Vec::new()
+    }
+
     fn cancel_all(&mut self, client_id: u64, request_id: u64) -> Vec<ExecutionReport> {
         let mut orders: Vec<_> = self
             .orders
