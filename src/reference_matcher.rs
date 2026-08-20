@@ -419,6 +419,15 @@ impl ReferenceExchange {
                 self.session = state;
                 Ok(Vec::new())
             }
+            GatewayCommand::SetExpiry {
+                client_order_id,
+                deadline,
+            } => Ok(self.set_expiry(
+                request.client_id,
+                request.request_id,
+                client_order_id,
+                deadline,
+            )),
             GatewayCommand::Replace {
                 client_order_id,
                 replacement_client_order_id,
@@ -675,7 +684,6 @@ impl ReferenceExchange {
         )]
     }
 
-    #[allow(dead_code)]
     fn set_expiry(
         &mut self,
         client_id: u64,
@@ -1392,6 +1400,13 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
                     } else {
                         crate::session::SessionState::Open
                     },
+                },
+                GatewayCommand::SetExpiry {
+                    client_order_id,
+                    deadline,
+                } => GatewayCommand::SetExpiry {
+                    client_order_id: client_order_id ^ (1 << 63),
+                    deadline,
                 },
                 GatewayCommand::Replace {
                     client_order_id,

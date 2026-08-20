@@ -78,6 +78,10 @@ pub enum GatewayCommand {
     SetSession {
         state: SessionState,
     },
+    SetExpiry {
+        client_order_id: u64,
+        deadline: Option<u64>,
+    },
     Replace {
         client_order_id: u64,
         replacement_client_order_id: u64,
@@ -295,6 +299,15 @@ impl SimulatedExchange {
                 self.session = state;
                 Vec::new()
             }
+            GatewayCommand::SetExpiry {
+                client_order_id,
+                deadline,
+            } => self.set_expiry(
+                request.client_id,
+                request.request_id,
+                client_order_id,
+                deadline,
+            ),
             GatewayCommand::Replace {
                 client_order_id,
                 replacement_client_order_id,
@@ -823,7 +836,6 @@ impl SimulatedExchange {
         )]
     }
 
-    #[allow(dead_code)]
     fn set_expiry(
         &mut self,
         client_id: u64,
