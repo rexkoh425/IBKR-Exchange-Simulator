@@ -2330,6 +2330,47 @@ mod tests {
     }
 
     #[test]
+    fn expiry_deadlines_require_owner_and_future_time() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(7, 1, new_order(1, Side::Buy, 100, 2)))
+            .unwrap();
+        let deadline = GatewayCommand::SetExpiry {
+            client_order_id: 1,
+            deadline: Some(10),
+        };
+        assert!(exchange
+            .handle(request(7, 2, deadline.clone()))
+            .unwrap()
+            .reports
+            .is_empty());
+        let foreign = exchange.handle(request(8, 1, deadline)).unwrap();
+        assert_eq!(
+            foreign.reports[0].reject_reason,
+            Some(GatewayRejectReason::UnknownClientOrderId)
+        );
+        let past = exchange
+            .handle(request(
+                7,
+                3,
+                GatewayCommand::SetExpiry {
+                    client_order_id: 1,
+                    deadline: Some(0),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            past.reports[0].reject_reason,
+            Some(GatewayRejectReason::ExpiryNotFuture)
+        );
+        assert_eq!(exchange.expiry_for_client(7, 1), Some(10));
+        assert_eq!(
+            exchange.order_state_for_client(7, 1).unwrap().status,
+            OrderStatus::Accepted
+        );
+    }
+
+    #[test]
     fn cancel_all_is_client_scoped_ordered_and_idempotent() {
         let mut exchange = SimulatedExchange::default();
         exchange
