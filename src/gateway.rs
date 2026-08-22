@@ -390,6 +390,7 @@ impl SimulatedExchange {
 
     fn remove_live_order(&mut self, exchange_id: u64) {
         self.live_orders.remove(&exchange_id);
+        self.expiry.remove(exchange_id);
     }
 
     pub fn order_states(&self) -> Vec<OrderStateSnapshot> {
@@ -2367,6 +2368,32 @@ mod tests {
         assert_eq!(
             exchange.order_state_for_client(7, 1).unwrap().status,
             OrderStatus::Accepted
+        );
+    }
+
+    #[test]
+    fn filling_an_order_removes_its_expiry() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Sell, 100, 1)))
+            .unwrap();
+        exchange
+            .handle(request(
+                1,
+                2,
+                GatewayCommand::SetExpiry {
+                    client_order_id: 1,
+                    deadline: Some(10),
+                },
+            ))
+            .unwrap();
+        exchange
+            .handle(request(2, 1, new_order(1, Side::Buy, 100, 1)))
+            .unwrap();
+        assert_eq!(exchange.expiry_for_client(1, 1), None);
+        assert_eq!(
+            exchange.order_state_for_client(1, 1).unwrap().status,
+            OrderStatus::Filled
         );
     }
 

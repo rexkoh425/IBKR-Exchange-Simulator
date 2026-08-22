@@ -666,6 +666,7 @@ impl ReferenceExchange {
         order.status = OrderStatus::Cancelled;
         self.orders.insert(key, order.clone());
         self.live.remove(&order.exchange_order_id);
+        self.expiries.remove(&order.exchange_order_id);
         vec![self.report(
             client_id,
             request_id,
@@ -907,6 +908,7 @@ impl ReferenceExchange {
         cancelled_old.status = OrderStatus::Cancelled;
         self.orders.insert(old_key, cancelled_old.clone());
         self.live.remove(&old.exchange_order_id);
+        self.expiries.remove(&old.exchange_order_id);
         reports.push(self.report(
             client_id,
             request_id,
@@ -991,6 +993,7 @@ impl ReferenceExchange {
             self.orders.insert(maker_key, maker.clone());
             if maker_leaves == 0 {
                 self.live.remove(&trade.maker_order_id);
+                self.expiries.remove(&trade.maker_order_id);
             }
             reports.push(self.report(
                 maker_key.client_id,
