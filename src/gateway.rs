@@ -2398,6 +2398,44 @@ mod tests {
     }
 
     #[test]
+    fn replacement_does_not_inherit_old_deadline() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 100, 2)))
+            .unwrap();
+        exchange
+            .handle(request(
+                1,
+                2,
+                GatewayCommand::SetExpiry {
+                    client_order_id: 1,
+                    deadline: Some(10),
+                },
+            ))
+            .unwrap();
+        exchange
+            .handle(request(
+                1,
+                3,
+                GatewayCommand::Replace {
+                    client_order_id: 1,
+                    replacement_client_order_id: 2,
+                    price_ticks: 101,
+                    quantity_lots: 2,
+                    time_in_force: TimeInForce::Gtc,
+                    post_only: false,
+                },
+            ))
+            .unwrap();
+        assert_eq!(exchange.expiry_for_client(1, 1), None);
+        assert_eq!(exchange.expiry_for_client(1, 2), None);
+        assert_eq!(
+            exchange.order_state_for_client(1, 2).unwrap().status,
+            OrderStatus::Accepted
+        );
+    }
+
+    #[test]
     fn cancel_all_is_client_scoped_ordered_and_idempotent() {
         let mut exchange = SimulatedExchange::default();
         exchange
