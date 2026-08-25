@@ -2436,6 +2436,45 @@ mod tests {
     }
 
     #[test]
+    fn retrying_old_expiry_does_not_restore_cleared_deadline() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 100, 2)))
+            .unwrap();
+        let schedule = GatewayCommand::SetExpiry {
+            client_order_id: 1,
+            deadline: Some(10),
+        };
+        exchange.handle(request(1, 2, schedule.clone())).unwrap();
+        exchange
+            .handle(request(
+                1,
+                3,
+                GatewayCommand::SetExpiry {
+                    client_order_id: 1,
+                    deadline: None,
+                },
+            ))
+            .unwrap();
+        assert!(exchange.handle(request(1, 2, schedule)).unwrap().replayed);
+        assert_eq!(exchange.expiry_for_client(1, 1), None);
+        exchange
+            .handle(request(
+                1,
+                4,
+                GatewayCommand::SetExpiry {
+                    client_order_id: 1,
+                    deadline: Some(20),
+                },
+            ))
+            .unwrap();
+        exchange
+            .handle(request(1, 5, GatewayCommand::Cancel { client_order_id: 1 }))
+            .unwrap();
+        assert_eq!(exchange.expiry_for_client(1, 1), None);
+    }
+
+    #[test]
     fn cancel_all_is_client_scoped_ordered_and_idempotent() {
         let mut exchange = SimulatedExchange::default();
         exchange
