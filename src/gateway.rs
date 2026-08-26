@@ -101,6 +101,7 @@ pub enum OrderStatus {
     PartiallyFilled,
     Filled,
     Cancelled,
+    Expired,
     Rejected,
 }
 
@@ -409,7 +410,10 @@ impl SimulatedExchange {
                 cumulative_quantity_lots: record.cumulative_quantity_lots,
                 leaves_quantity_lots: if matches!(
                     record.status,
-                    OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+                    OrderStatus::Filled
+                        | OrderStatus::Cancelled
+                        | OrderStatus::Expired
+                        | OrderStatus::Rejected
                 ) {
                     0
                 } else {
@@ -504,7 +508,10 @@ impl SimulatedExchange {
                     .is_some_and(|engine| engine.contains_live_order(*exchange_id))
                 || matches!(
                     record.status,
-                    OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+                    OrderStatus::Filled
+                        | OrderStatus::Cancelled
+                        | OrderStatus::Expired
+                        | OrderStatus::Rejected
                 )
             {
                 return Err(format!(
@@ -1400,6 +1407,7 @@ fn status_code(status: OrderStatus) -> u8 {
         OrderStatus::Filled => 2,
         OrderStatus::Cancelled => 3,
         OrderStatus::Rejected => 4,
+        OrderStatus::Expired => 5,
     }
 }
 
@@ -1927,7 +1935,7 @@ mod tests {
                         assert_eq!(report.cumulative_quantity_lots, report.order_quantity_lots);
                         assert_eq!(report.leaves_quantity_lots, 0);
                     }
-                    OrderStatus::Cancelled => {
+                    OrderStatus::Cancelled | OrderStatus::Expired => {
                         assert!(report.cumulative_quantity_lots <= report.order_quantity_lots);
                         assert_eq!(report.leaves_quantity_lots, 0);
                     }

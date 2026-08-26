@@ -1204,7 +1204,10 @@ impl ReferenceExchange {
                 cumulative_quantity_lots: order.cumulative_lots,
                 leaves_quantity_lots: if matches!(
                     order.status,
-                    OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+                    OrderStatus::Filled
+                        | OrderStatus::Cancelled
+                        | OrderStatus::Expired
+                        | OrderStatus::Rejected
                 ) {
                     0
                 } else {
@@ -1342,6 +1345,7 @@ fn status_code(status: OrderStatus) -> u8 {
         OrderStatus::Filled => 2,
         OrderStatus::Cancelled => 3,
         OrderStatus::Rejected => 4,
+        OrderStatus::Expired => 5,
     }
 }
 
