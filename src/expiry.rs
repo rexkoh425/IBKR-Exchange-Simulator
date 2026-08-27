@@ -47,11 +47,7 @@ impl ExpirySchedule {
             return Err(ExpiryError::ClockRegression);
         }
         self.now = now;
-        let due: Vec<_> = self
-            .by_deadline
-            .range(..=(now, u64::MAX))
-            .copied()
-            .collect();
+        let due: Vec<_> = self.due_at(now).collect();
         for (_, order_id) in &due {
             self.remove(*order_id);
         }
@@ -60,6 +56,11 @@ impl ExpirySchedule {
 
     pub fn pending(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.by_deadline.iter().copied()
+    }
+
+    /// Inspect the ordered due set without advancing the clock or removing orders.
+    pub fn due_at(&self, now: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.by_deadline.range(..=(now, u64::MAX)).copied()
     }
 }
 
@@ -94,5 +95,18 @@ mod tests {
         schedule.set(7, None).unwrap();
         assert_eq!(schedule.deadline(7), None);
         assert!(schedule.advance(20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inspecting_due_orders_does_not_change_the_schedule() {
+        let mut schedule = ExpirySchedule::default();
+        schedule.set(3, Some(10)).unwrap();
+        schedule.set(2, Some(10)).unwrap();
+        assert_eq!(
+            schedule.due_at(10).collect::<Vec<_>>(),
+            vec![(10, 2), (10, 3)]
+        );
+        assert_eq!(schedule.now(), 0);
+        assert_eq!(schedule.advance(10).unwrap(), vec![2, 3]);
     }
 }
