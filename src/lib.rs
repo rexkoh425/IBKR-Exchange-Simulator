@@ -157,6 +157,11 @@ impl MatchingEngine {
         Self::default()
     }
 
+    /// Number of further engine sequence values available for accepted actions.
+    pub fn remaining_sequences(&self) -> u64 {
+        u64::MAX - self.next_sequence
+    }
+
     /// Match at eligible best prices, with each execution priced at the resting order.
     pub fn submit(&mut self, request: OrderRequest) -> SubmitResult {
         self.submit_with_options(request, OrderOptions::default())
@@ -711,6 +716,17 @@ impl ReplaceResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remaining_sequence_capacity_tracks_accepted_commands() {
+        let mut engine = MatchingEngine::new();
+        assert_eq!(engine.remaining_sequences(), u64::MAX);
+        engine.submit(order(1, Side::Buy, 100, 1));
+        assert_eq!(engine.remaining_sequences(), u64::MAX - 1);
+        engine.next_sequence = u64::MAX;
+        assert_eq!(engine.remaining_sequences(), 0);
+        assert_eq!(engine.cancel(1), Err(RejectReason::SequenceExhausted));
+    }
     fn order(order_id: u64, side: Side, price_ticks: i64, quantity_lots: u64) -> OrderRequest {
         OrderRequest {
             order_id,
