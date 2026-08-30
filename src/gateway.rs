@@ -161,6 +161,10 @@ pub enum GatewayError {
     InvalidRequestId,
     IdempotencyConflict,
     UnauthorizedSessionControl,
+    UnauthorizedClockControl,
+    ClockRegression,
+    EngineSequenceExhausted,
+    ReportSequenceExhausted,
     ExchangeOrderIdExhausted,
     LockPoisoned,
 }
@@ -174,6 +178,16 @@ impl std::fmt::Display for GatewayError {
             }
             Self::UnauthorizedSessionControl => {
                 formatter.write_str("only control client 0 may change the session")
+            }
+            Self::UnauthorizedClockControl => {
+                formatter.write_str("only control client 0 may advance time")
+            }
+            Self::ClockRegression => formatter.write_str("logical time cannot move backwards"),
+            Self::EngineSequenceExhausted => {
+                formatter.write_str("matcher sequence space is exhausted")
+            }
+            Self::ReportSequenceExhausted => {
+                formatter.write_str("execution report sequence space is exhausted")
             }
             Self::ExchangeOrderIdExhausted => {
                 formatter.write_str("simulated exchange order ID space is exhausted")
