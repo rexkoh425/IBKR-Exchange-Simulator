@@ -858,6 +858,39 @@ impl SimulatedExchange {
         )]
     }
 
+    #[allow(dead_code)]
+    fn preflight_expiry_advance(&self, timestamp: u64) -> Result<(), GatewayError> {
+        if timestamp < self.expiry.now() {
+            return Err(GatewayError::ClockRegression);
+        }
+        let mut counts: HashMap<&str, u64> = HashMap::new();
+        let mut report_count = 0_u128;
+        for (_, order_id) in self.expiry.due_at(timestamp) {
+            let key = self
+                .live_orders
+                .get(&order_id)
+                .expect("scheduled order is live");
+            let order = &self.orders[key];
+            let count = counts.entry(&order.symbol).or_default();
+            *count = count.saturating_add(1);
+            report_count += 1;
+        }
+        if self
+            .next_report_sequence
+            .checked_add(report_count)
+            .is_none()
+        {
+            return Err(GatewayError::ReportSequenceExhausted);
+        }
+        if counts
+            .into_iter()
+            .any(|(symbol, count)| self.engines[symbol].remaining_sequences() < count)
+        {
+            return Err(GatewayError::EngineSequenceExhausted);
+        }
+        Ok(())
+    }
+
     fn set_expiry(
         &mut self,
         client_id: u64,
