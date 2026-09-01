@@ -685,6 +685,37 @@ impl ReferenceExchange {
         )]
     }
 
+    #[allow(dead_code)]
+    fn preflight_expiry_advance(&self, timestamp: u64) -> Result<(), GatewayError> {
+        if timestamp < self.expiry_clock {
+            return Err(GatewayError::ClockRegression);
+        }
+        let mut counts: HashMap<&str, u64> = HashMap::new();
+        let mut report_count = 0_u128;
+        for (&order_id, &deadline) in &self.expiries {
+            if deadline <= timestamp {
+                let order = &self.orders[&self.live[&order_id]];
+                let count = counts.entry(&order.symbol).or_default();
+                *count = count.saturating_add(1);
+                report_count += 1;
+            }
+        }
+        if self
+            .next_report_sequence
+            .checked_add(report_count)
+            .is_none()
+        {
+            return Err(GatewayError::ReportSequenceExhausted);
+        }
+        if counts
+            .into_iter()
+            .any(|(symbol, count)| u64::MAX - self.engines[symbol].next_sequence < count)
+        {
+            return Err(GatewayError::EngineSequenceExhausted);
+        }
+        Ok(())
+    }
+
     fn set_expiry(
         &mut self,
         client_id: u64,
