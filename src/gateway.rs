@@ -858,7 +858,6 @@ impl SimulatedExchange {
         )]
     }
 
-    #[allow(dead_code)]
     fn preflight_expiry_advance(&self, timestamp: u64) -> Result<(), GatewayError> {
         if timestamp < self.expiry.now() {
             return Err(GatewayError::ClockRegression);
@@ -889,6 +888,27 @@ impl SimulatedExchange {
             return Err(GatewayError::EngineSequenceExhausted);
         }
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn advance_time(&mut self, timestamp: u64) -> Result<Vec<ExecutionReport>, GatewayError> {
+        self.preflight_expiry_advance(timestamp)?;
+        let due = self
+            .expiry
+            .advance(timestamp)
+            .expect("clock was preflighted");
+        let mut reports = Vec::with_capacity(due.len());
+        for order_id in due {
+            let key = self.live_orders[&order_id];
+            let mut report = self
+                .cancel(key.client_id, 0, key.client_order_id)
+                .pop()
+                .expect("one cancel report");
+            self.orders.get_mut(&key).expect("order is live").status = OrderStatus::Expired;
+            report.status = OrderStatus::Expired;
+            reports.push(report);
+        }
+        Ok(reports)
     }
 
     fn set_expiry(
