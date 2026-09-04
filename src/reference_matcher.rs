@@ -685,7 +685,6 @@ impl ReferenceExchange {
         )]
     }
 
-    #[allow(dead_code)]
     fn preflight_expiry_advance(&self, timestamp: u64) -> Result<(), GatewayError> {
         if timestamp < self.expiry_clock {
             return Err(GatewayError::ClockRegression);
@@ -714,6 +713,31 @@ impl ReferenceExchange {
             return Err(GatewayError::EngineSequenceExhausted);
         }
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn advance_time(&mut self, timestamp: u64) -> Result<Vec<ExecutionReport>, GatewayError> {
+        self.preflight_expiry_advance(timestamp)?;
+        let mut due: Vec<_> = self
+            .expiries
+            .iter()
+            .filter(|(_, deadline)| **deadline <= timestamp)
+            .map(|(&order_id, &deadline)| (deadline, order_id))
+            .collect();
+        due.sort_unstable();
+        self.expiry_clock = timestamp;
+        let mut reports = Vec::with_capacity(due.len());
+        for (_, order_id) in due {
+            let key = self.live[&order_id];
+            let mut report = self
+                .cancel(key.client_id, 0, key.client_order_id)
+                .pop()
+                .expect("one cancel report");
+            self.orders.get_mut(&key).expect("order is live").status = OrderStatus::Expired;
+            report.status = OrderStatus::Expired;
+            reports.push(report);
+        }
+        Ok(reports)
     }
 
     fn set_expiry(
