@@ -428,6 +428,12 @@ impl ReferenceExchange {
                 client_order_id,
                 deadline,
             )),
+            GatewayCommand::AdvanceTime { timestamp } => {
+                if request.client_id != 0 {
+                    return Err(GatewayError::UnauthorizedClockControl);
+                }
+                self.advance_time(timestamp)
+            }
             GatewayCommand::Replace {
                 client_order_id,
                 replacement_client_order_id,
@@ -715,7 +721,6 @@ impl ReferenceExchange {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn advance_time(&mut self, timestamp: u64) -> Result<Vec<ExecutionReport>, GatewayError> {
         self.preflight_expiry_advance(timestamp)?;
         let mut due: Vec<_> = self
@@ -1469,6 +1474,9 @@ fn random_requests(seed: u64, count: usize) -> Vec<GatewayRequest> {
                 } => GatewayCommand::SetExpiry {
                     client_order_id: client_order_id ^ (1 << 63),
                     deadline,
+                },
+                GatewayCommand::AdvanceTime { timestamp } => GatewayCommand::AdvanceTime {
+                    timestamp: timestamp ^ 1,
                 },
                 GatewayCommand::Replace {
                     client_order_id,

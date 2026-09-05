@@ -82,6 +82,9 @@ pub enum GatewayCommand {
         client_order_id: u64,
         deadline: Option<u64>,
     },
+    AdvanceTime {
+        timestamp: u64,
+    },
     Replace {
         client_order_id: u64,
         replacement_client_order_id: u64,
@@ -323,6 +326,12 @@ impl SimulatedExchange {
                 client_order_id,
                 deadline,
             ),
+            GatewayCommand::AdvanceTime { timestamp } => {
+                if request.client_id != 0 {
+                    return Err(GatewayError::UnauthorizedClockControl);
+                }
+                self.advance_time(timestamp)?
+            }
             GatewayCommand::Replace {
                 client_order_id,
                 replacement_client_order_id,
@@ -890,7 +899,6 @@ impl SimulatedExchange {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn advance_time(&mut self, timestamp: u64) -> Result<Vec<ExecutionReport>, GatewayError> {
         self.preflight_expiry_advance(timestamp)?;
         let due = self
