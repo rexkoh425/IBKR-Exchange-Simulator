@@ -1556,6 +1556,13 @@ mod tests {
         new_order_for_symbol(default_symbol(), id, side, price, quantity)
     }
 
+    fn set_deadline(client_order_id: u64, deadline: u64) -> GatewayCommand {
+        GatewayCommand::SetExpiry {
+            client_order_id,
+            deadline: Some(deadline),
+        }
+    }
+
     fn new_order_for_symbol(
         symbol: impl Into<String>,
         id: u64,
@@ -2555,6 +2562,35 @@ mod tests {
             .handle(request(1, 5, GatewayCommand::Cancel { client_order_id: 1 }))
             .unwrap();
         assert_eq!(exchange.expiry_for_client(1, 1), None);
+    }
+
+    #[test]
+    fn logical_deadline_expires_partial_order_at_exact_boundary() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Sell, 100, 3)))
+            .unwrap();
+        exchange.handle(request(1, 2, set_deadline(1, 10))).unwrap();
+        exchange
+            .handle(request(2, 1, new_order(1, Side::Buy, 100, 1)))
+            .unwrap();
+        assert!(exchange
+            .handle(request(0, 1, GatewayCommand::AdvanceTime { timestamp: 9 }))
+            .unwrap()
+            .reports
+            .is_empty());
+        let expired = exchange
+            .handle(request(0, 2, GatewayCommand::AdvanceTime { timestamp: 10 }))
+            .unwrap();
+        let report = &expired.reports[0];
+        assert_eq!((report.client_id, report.request_id), (1, 0));
+        assert_eq!(report.status, OrderStatus::Expired);
+        assert_eq!(
+            (report.cumulative_quantity_lots, report.leaves_quantity_lots),
+            (1, 0)
+        );
+        assert_eq!(exchange.live_order_count(), 0);
+        assert!(exchange.check_invariants().is_ok());
     }
 
     #[test]
