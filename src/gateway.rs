@@ -2594,6 +2594,52 @@ mod tests {
     }
 
     #[test]
+    fn expiry_reports_are_ordered_and_retries_do_not_repeat_them() {
+        let mut exchange = SimulatedExchange::default();
+        for client in 1..=3 {
+            exchange
+                .handle(request(client, 1, new_order(1, Side::Sell, 100, 1)))
+                .unwrap();
+            exchange
+                .handle(request(
+                    client,
+                    2,
+                    set_deadline(1, if client == 3 { 8 } else { 10 }),
+                ))
+                .unwrap();
+        }
+        exchange
+            .handle(request(
+                0,
+                1,
+                GatewayCommand::SetSession {
+                    state: SessionState::Closed,
+                },
+            ))
+            .unwrap();
+        let advance = GatewayCommand::AdvanceTime { timestamp: 10 };
+        let first = exchange.handle(request(0, 2, advance.clone())).unwrap();
+        let fingerprint = exchange.state_fingerprint();
+        let retry = exchange.handle(request(0, 2, advance)).unwrap();
+        assert_eq!(
+            first
+                .reports
+                .iter()
+                .map(|report| report.client_id)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
+        assert!(first
+            .reports
+            .iter()
+            .all(|report| report.status == OrderStatus::Expired));
+        assert!(retry.replayed);
+        assert_eq!(retry.reports, first.reports);
+        assert_eq!(exchange.state_fingerprint(), fingerprint);
+        assert_eq!(exchange.session_state(), SessionState::Closed);
+    }
+
+    #[test]
     fn cancel_all_is_client_scoped_ordered_and_idempotent() {
         let mut exchange = SimulatedExchange::default();
         exchange
