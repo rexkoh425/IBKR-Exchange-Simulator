@@ -2640,6 +2640,25 @@ mod tests {
     }
 
     #[test]
+    fn clock_rejects_regression_and_non_control_clients() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(0, 1, GatewayCommand::AdvanceTime { timestamp: 10 }))
+            .unwrap();
+        let before = exchange.state_fingerprint();
+        assert_eq!(
+            exchange.handle(request(7, 1, GatewayCommand::AdvanceTime { timestamp: 11 })),
+            Err(GatewayError::UnauthorizedClockControl)
+        );
+        assert_eq!(
+            exchange.handle(request(0, 2, GatewayCommand::AdvanceTime { timestamp: 9 })),
+            Err(GatewayError::ClockRegression)
+        );
+        assert_eq!(exchange.logical_time(), 10);
+        assert_eq!(exchange.state_fingerprint(), before);
+    }
+
+    #[test]
     fn cancel_all_is_client_scoped_ordered_and_idempotent() {
         let mut exchange = SimulatedExchange::default();
         exchange
