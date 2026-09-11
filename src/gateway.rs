@@ -2681,6 +2681,28 @@ mod tests {
     }
 
     #[test]
+    fn expiry_preflight_rejects_insufficient_report_sequences() {
+        let mut exchange = SimulatedExchange::default();
+        for client in 1..=2 {
+            exchange
+                .handle(request(client, 1, new_order(1, Side::Sell, 100, 1)))
+                .unwrap();
+            exchange
+                .handle(request(client, 2, set_deadline(1, 10)))
+                .unwrap();
+        }
+        exchange.next_report_sequence = u128::MAX - 1;
+        let before = exchange.state_fingerprint();
+        assert_eq!(
+            exchange.handle(request(0, 1, GatewayCommand::AdvanceTime { timestamp: 10 })),
+            Err(GatewayError::ReportSequenceExhausted)
+        );
+        assert_eq!(exchange.logical_time(), 0);
+        assert_eq!(exchange.live_order_count(), 2);
+        assert_eq!(exchange.state_fingerprint(), before);
+    }
+
+    #[test]
     fn cancel_all_is_client_scoped_ordered_and_idempotent() {
         let mut exchange = SimulatedExchange::default();
         exchange
