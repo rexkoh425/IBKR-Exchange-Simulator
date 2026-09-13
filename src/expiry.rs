@@ -62,6 +62,18 @@ impl ExpirySchedule {
     pub fn due_at(&self, now: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.by_deadline.range(..=(now, u64::MAX)).copied()
     }
+
+    pub fn check_invariants(&self) -> Result<(), String> {
+        if self.by_order.len() != self.by_deadline.len() {
+            return Err("deadline indexes have different sizes".into());
+        }
+        for (&order_id, &deadline) in &self.by_order {
+            if deadline <= self.now || !self.by_deadline.contains(&(deadline, order_id)) {
+                return Err(format!("invalid deadline index for order {order_id}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -108,5 +120,13 @@ mod tests {
         );
         assert_eq!(schedule.now(), 0);
         assert_eq!(schedule.advance(10).unwrap(), vec![2, 3]);
+    }
+
+    #[test]
+    fn inconsistent_deadline_indexes_are_detected() {
+        let mut schedule = ExpirySchedule::default();
+        schedule.set(1, Some(10)).unwrap();
+        schedule.by_deadline.clear();
+        assert!(schedule.check_invariants().is_err());
     }
 }

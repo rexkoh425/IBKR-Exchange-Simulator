@@ -511,6 +511,12 @@ impl SimulatedExchange {
     }
 
     pub fn check_invariants(&self) -> Result<(), String> {
+        self.expiry.check_invariants()?;
+        for (_, order_id) in self.expiry.pending() {
+            if !self.live_orders.contains_key(&order_id) {
+                return Err(format!("expiry references non-live order {order_id}"));
+            }
+        }
         for (symbol, engine) in &self.engines {
             engine
                 .check_invariants()
@@ -2700,6 +2706,13 @@ mod tests {
         assert_eq!(exchange.logical_time(), 0);
         assert_eq!(exchange.live_order_count(), 2);
         assert_eq!(exchange.state_fingerprint(), before);
+    }
+
+    #[test]
+    fn invariants_detect_deadlines_for_missing_orders() {
+        let mut exchange = SimulatedExchange::default();
+        exchange.expiry.set(99, Some(10)).unwrap();
+        assert!(exchange.check_invariants().is_err());
     }
 
     #[test]
