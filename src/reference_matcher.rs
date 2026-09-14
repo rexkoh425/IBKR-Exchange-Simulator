@@ -1697,7 +1697,7 @@ proptest! {
                 _ => TimeInForce::Gtc,
             };
             let post_only = flags % 4 == 3;
-            let command = match kind % 5 {
+            let command = match kind % 7 {
                 0 => GatewayCommand::New {
                     client_order_id,
                     symbol: if flags & 1 == 0 { "AAPL" } else { "MSFT" }.into(),
@@ -1717,9 +1717,14 @@ proptest! {
                     post_only,
                 },
                 3 => GatewayCommand::CancelAll,
-                _ => GatewayCommand::SetSession {
+                4 => GatewayCommand::SetSession {
                     state: if flags & 4 == 0 { crate::session::SessionState::Open } else { crate::session::SessionState::Closed },
                 },
+                5 => GatewayCommand::SetExpiry {
+                    client_order_id: u64::from(flags % 16),
+                    deadline: if flags & 8 == 0 { Some(u64::from(raw_quantity % 20)) } else { None },
+                },
+                _ => GatewayCommand::AdvanceTime { timestamp: u64::from(raw_quantity % 20) },
             };
             let request = GatewayRequest { client_id, request_id: index as u64 + 1, command };
             prop_assert_eq!(production.handle(request.clone()), reference.handle(request));
