@@ -32,6 +32,8 @@ pub struct OrderStateSnapshot {
     pub status: OrderStatus,
     pub time_in_force: TimeInForce,
     pub post_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +447,7 @@ impl SimulatedExchange {
                 status: record.status,
                 time_in_force: record.time_in_force,
                 post_only: record.post_only,
+                expires_at: self.expiry.deadline(record.exchange_order_id),
             })
             .collect();
         states.sort_by_key(|state| (state.client_id, state.client_order_id));
@@ -483,6 +486,7 @@ impl SimulatedExchange {
             status: record.status,
             time_in_force: record.time_in_force,
             post_only: record.post_only,
+            expires_at: self.expiry.deadline(record.exchange_order_id),
         })
     }
 
@@ -2461,6 +2465,10 @@ mod tests {
             Some(GatewayRejectReason::ExpiryNotFuture)
         );
         assert_eq!(exchange.expiry_for_client(7, 1), Some(10));
+        assert_eq!(
+            exchange.order_state_for_client(7, 1).unwrap().expires_at,
+            Some(10)
+        );
         assert_eq!(
             exchange.order_state_for_client(7, 1).unwrap().status,
             OrderStatus::Accepted

@@ -1276,6 +1276,7 @@ impl ReferenceExchange {
                 status: order.status,
                 time_in_force: order.time_in_force,
                 post_only: order.post_only,
+                expires_at: self.expiries.get(&order.exchange_order_id).copied(),
             })
             .collect();
         states.sort_by_key(|order| (order.client_id, order.client_order_id));
