@@ -131,6 +131,8 @@ pub struct JournalSummary {
     pub state_checksum: u64,
     #[serde(default)]
     pub session: SessionState,
+    #[serde(default)]
+    pub logical_time: u64,
 }
 
 impl JournalSummary {
@@ -144,6 +146,7 @@ impl JournalSummary {
             order_states: Vec::new(),
             state_checksum: 0,
             session: SessionState::Open,
+            logical_time: 0,
         }
     }
 
@@ -171,6 +174,7 @@ impl JournalSummary {
         self.order_states = exchange.order_states();
         self.state_checksum = exchange.state_fingerprint();
         self.session = exchange.session_state();
+        self.logical_time = exchange.logical_time();
     }
 
     pub fn rejected_execution_reports(&self) -> usize {
@@ -185,6 +189,7 @@ impl JournalSummary {
             state_fingerprint: self.state_checksum,
             orders: self.order_states.clone(),
             session: self.session,
+            logical_time: self.logical_time,
         }
     }
 }
@@ -562,6 +567,7 @@ mod tests {
             state_fingerprint: journal.exchange().state_fingerprint(),
             orders: journal.exchange().order_states(),
             session: journal.exchange().session_state(),
+            logical_time: journal.exchange().logical_time(),
         };
         let original_reports: Vec<_> = original_outcomes
             .iter()
@@ -580,6 +586,7 @@ mod tests {
                 state_fingerprint: recovered.exchange.state_fingerprint(),
                 orders: recovered.exchange.order_states(),
                 session: recovered.exchange.session_state(),
+                logical_time: recovered.exchange.logical_time(),
             },
             original_state
         );

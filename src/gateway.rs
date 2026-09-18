@@ -1459,6 +1459,7 @@ impl ConcurrentSimulatedExchange {
             state_fingerprint: exchange.state_fingerprint(),
             orders: exchange.order_states(),
             session: exchange.session_state(),
+            logical_time: exchange.logical_time(),
         })
     }
 
@@ -1476,6 +1477,8 @@ pub struct ExchangeStateSnapshot {
     pub orders: Vec<OrderStateSnapshot>,
     #[serde(default)]
     pub session: SessionState,
+    #[serde(default)]
+    pub logical_time: u64,
 }
 
 fn side_code(side: Side) -> u8 {
@@ -2281,6 +2284,7 @@ mod tests {
         let snapshot: ExchangeStateSnapshot =
             serde_json::from_str(r#"{"state_fingerprint":0,"orders":[]}"#).unwrap();
         assert_eq!(snapshot.session, SessionState::Open);
+        assert_eq!(snapshot.logical_time, 0);
     }
 
     #[test]
