@@ -649,6 +649,37 @@ mod tests {
     }
 
     #[test]
+    fn journal_restores_pending_deadlines_and_logical_time() {
+        let mut bytes = Vec::new();
+        let mut journal = ExchangeJournal::new(GatewayConfig::default(), &mut bytes);
+        journal.handle(requests()[0].clone()).unwrap();
+        journal
+            .handle(GatewayRequest {
+                client_id: 1,
+                request_id: 2,
+                command: GatewayCommand::SetExpiry {
+                    client_order_id: 10,
+                    deadline: Some(10),
+                },
+            })
+            .unwrap();
+        journal
+            .handle(GatewayRequest {
+                client_id: 0,
+                request_id: 1,
+                command: GatewayCommand::AdvanceTime { timestamp: 9 },
+            })
+            .unwrap();
+        let expected = journal.summary();
+        drop(journal);
+        let recovered = recover(Cursor::new(bytes), GatewayConfig::default()).unwrap();
+        assert_eq!(recovered.summary, expected);
+        assert_eq!(recovered.summary.logical_time, 9);
+        assert_eq!(recovered.exchange.expiry_for_client(1, 10), Some(10));
+        assert_eq!(recovered.summary.order_states[0].expires_at, Some(10));
+    }
+
+    #[test]
     fn journal_records_protocol_rejections_and_replays_them() {
         let mut bytes = Vec::new();
         let mut journal = ExchangeJournal::new(GatewayConfig::default(), &mut bytes);
