@@ -1,0 +1,3 @@
+{"client_id":0,"request_id":2,"command":{"type":"advance_time","timestamp":10}}
+{"client_id":0,"request_id":2,"command":{"type":"advance_time","timestamp":10}}
+{"client_id":1,"request_id":3,"command":{"type":"new","client_order_id":12,"symbol":"AAPL","side":"sell","price_ticks":101,"quantity_lots":2}}
