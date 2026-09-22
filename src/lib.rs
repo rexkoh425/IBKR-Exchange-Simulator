@@ -22,6 +22,8 @@ pub mod replay;
 pub mod session;
 
 #[cfg(test)]
+mod expiry_property_tests;
+#[cfg(test)]
 mod reference_matcher;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
