@@ -8,6 +8,7 @@
 - Only the owning client may cancel or replace an order. A cancel or replace of an unknown, terminal, or foreign order is rejected without changing the book.
 - `cancel_all` affects only live orders owned by the requesting client. It emits ordinary cancel reports in ascending exchange-order ID order; an empty selection returns no reports. The request is idempotent like other commands.
 - The exchange starts open. Logical control client 0 can set the session open or closed. A closed session rejects new orders and replacements before allocating order IDs; cancels remain available, and resting orders retain their priority. Client IDs are not authenticated. See [session controls](session-controls.md).
+- Clients can assign or clear logical deadlines for their live orders. Control client 0 advances logical time, causing due orders to expire in deadline and exchange-ID order; expiry reports use request ID 0. See [order expiry](order-expiry.md).
 
 ## Limit orders and priority
 

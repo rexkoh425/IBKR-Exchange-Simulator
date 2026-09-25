@@ -6,22 +6,22 @@ Last audited: 2026-11-10. Current local branch: `codex/exchange-simulator-roadma
 
 "Actual program commits" counts only commits created for this roadmap, not historical project work. Existing evidence is cited separately so completed features are not repeated.
 
-Current total: **45 program commits**, including this progress update. Count the local roadmap commits with `git rev-list --count 8945ced..HEAD`.
+Current total: **82 program commits**, including this progress update. Count the local roadmap commits with `git rev-list --count 8945ced..HEAD`.
 
 | Milestone | Planned | Actual program commits | Status | Existing evidence / verification |
 | --- | ---: | ---: | --- | --- |
 | Exchange specification and architecture | 12 | 1 | Complete | `f6e88d1` adds the audited roadmap, architecture/boundary decisions and behavior specification. |
-| Advanced order handling | 14 | 17 | In progress | GTC/IOC/FOK/post-only, STP, client lookup, mass cancel and manual exchange session boundaries are implemented. Order expiry remains. |
+| Advanced order handling | 14 | 34 | In progress | GTC/IOC/FOK/post-only, STP, client lookup, mass cancel, manual exchange sessions and logical-clock expiry are implemented. Richer amendment semantics remain. |
 | Pre-trade risk controls | 12 | 0 | Partial | Per-order quantity/notional limits exist; client exposure, positions, rate controls and kill switches are missing. |
-| Advanced correctness verification | 12 | 13 | In progress | Reference comparisons include mass cancel and session controls; 100K commands across five seeds and proptest passed. |
+| Advanced correctness verification | 12 | 30 | In progress | Reference comparisons include mass cancel, sessions and expiry; 100K commands across five seeds and proptest passed. |
 | High-performance journaling | 14 | 3 | In progress | `c5437fe` adds v2 periodic checkpoints, v1 recovery/resume, configurable flush batches and replay outcome verification. `b59426a` retains five-trial scaling artifacts; `176c675` documents the policy. Incremental state hashing remains future work. |
 | Client sessions and sequencing | 12 | 0 | Partial | Client-scoped request idempotency/ownership and mutex serialization exist; no session lifecycle or cancel-on-disconnect. Racing lock acquisition order is not repeatable across independent runs. |
 | Exchange market-data publishing | 14 | 0 | Not started | Provider-neutral IBKR market replay exists; simulated-book publisher/subscriptions are absent. |
 | IBKR capture reliability | 10 | 0 | Partial | Read-only L1/L2 capture, disconnect/gap markers and depth reset handling exist; reconnect/resubscription completeness is not established. |
 | Network order gateway | 14 | 0 | Not started | Current gateway is in-process JSONL; no TCP/FIX transport. |
-| Low-latency optimization | 12 | 4 | Partial baseline exists | Pinned matcher/SPSC benchmarks and retained gateway trials for STP and session controls; no speedup is claimed. |
+| Low-latency optimization | 12 | 6 | Partial baseline exists | Pinned matcher/SPSC benchmarks and retained gateway trials for STP, sessions and expiry; no speedup is claimed. |
 | Deterministic paper trading | 12 | 0 | Not started | No strategy/accounting simulator. |
-| CI, docs and release quality | 12 | 7 | Partial | README, order semantics, roadmap and benchmark reports updated; no `.github` CI workflow was found in the repository audit. |
+| CI, docs and release quality | 12 | 8 | Partial | README, order semantics, roadmap and benchmark reports updated; no `.github` CI workflow was found in the repository audit. |
 
 ## Batch log
 
@@ -69,10 +69,17 @@ Current total: **45 program commits**, including this progress update. Count the
 - **Measurements:** five pinned 10K-request open-session trials gave 506.5k requests/s and 5.1 us p99, versus 508.6k/s and 5.0 us in the prior run. The non-interleaved runs do not isolate the cost of the check. See the [benchmark report](../benchmarks/exchange-session-gateway-2026-11-10.md).
 - **Next:** define deterministic order expiry and its journal/replay semantics, then implement and verify it in small commits.
 
+### Batch 5 — Logical order expiry
+
+- **Tasks:** added owner-managed deadlines, an explicit monotone logical clock, deterministic expiry reports, index cleanup, snapshots, sequence-capacity preflight and journal recovery. Clock control remains a logical client-ID convention without authentication.
+- **Verification:** formatting, Clippy, release build and all 91 tests passed, including schedule property tests and the 100K-command reference corpus. A separate-process run recovered a pending deadline at time 9, resumed at time 10, and recovered the expired order; both recovery summaries matched byte for byte.
+- **Measurements:** five pinned 10K-request trials with no scheduled deadlines gave 524.7k requests/s and 5.0 us p99. The earlier session run measured 506.5k/s and 5.1 us; non-interleaved runs do not establish an optimization. Raw rows and scope are in the [expiry report](../benchmarks/exchange-expiry-gateway-2026-11-10.md).
+- **Next:** add per-client outstanding exposure controls, beginning with explicit accounting and reference-model verification.
+
 ## Current risks and blockers
 
 - Journal full-state hashing now runs every 4,096 commands by default, but each checkpoint still traverses growing state and produced ~167 ms maximum samples at 100K. An incremental digest must retain replayed-outcome comparison and independent full-state verification.
 - Benchmark CPU time and peak working set have only been sampled process-wide, not independently attributed to every exchange stage.
 - Concurrent requests are serialized, but mutex acquisition is scheduler-dependent; deterministic replay requires recording the observed serialized order.
 - No live IBKR connection or live trading has been verified. Keep those claims separate from fixture/synthetic verification.
-- Exchange session control is manual and client IDs are unauthenticated. Client session lifecycles and deterministic order expiration remain future work.
+- Exchange session and clock control are manual and client IDs are unauthenticated. Client session lifecycles and automatic exchange calendars remain future work.

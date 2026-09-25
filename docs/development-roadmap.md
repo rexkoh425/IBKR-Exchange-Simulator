@@ -10,7 +10,7 @@ The audit was performed on local HEAD `8945ced` (56 commits in the local history
 
 | Area | Current state | Main gap |
 | --- | --- | --- |
-| Matching | FIFO price-time engine, integer ticks/lots, GTC/IOC/FOK/post-only and cancel-incoming STP; pinned 10M benchmark | Deterministic order expiry |
+| Matching | FIFO price-time engine, GTC/IOC/FOK/post-only, STP and logical-clock order expiry; pinned 10M benchmark | Richer amendment and venue-specific semantics |
 | Gateway | In-process multi-client JSONL, manual exchange session state, client-scoped lookup and mass cancel, reports, limits and idempotency | Client session lifecycle, exposure/position/rate controls, network transport |
 | Correctness | Independent flat-vector model, 100K baseline commands across 5 seeds, proptest and invariants | Generated advanced-order cases added; broaden for risk/session types and deep books |
 | Journal | v1/v2 JSONL append/recovery, periodic full-state checkpoints, record checksums and truncation detection | Incremental fingerprints, snapshot acceleration and stronger persistence boundaries |
