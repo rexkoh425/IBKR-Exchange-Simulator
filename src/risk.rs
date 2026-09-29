@@ -35,3 +35,36 @@ impl ClientExposure {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ClientExposure;
+
+    #[test]
+    fn exposure_add_and_release_preserve_quantity_and_notional() {
+        let value = ClientExposure::default()
+            .checked_add_order(100, 3)
+            .unwrap()
+            .checked_add_order(120, 2)
+            .unwrap();
+        assert_eq!(value.quantity_lots, 5);
+        assert_eq!(value.notional_ticks_lots, 540);
+        let reduced = value.checked_sub_order(100, 1).unwrap();
+        assert_eq!(
+            (reduced.quantity_lots, reduced.notional_ticks_lots),
+            (4, 440)
+        );
+    }
+
+    #[test]
+    fn exposure_arithmetic_rejects_overflow_underflow_and_invalid_prices() {
+        let maximum = ClientExposure {
+            quantity_lots: u128::MAX,
+            notional_ticks_lots: u128::MAX,
+        };
+        assert!(maximum.checked_add_order(1, 1).is_none());
+        assert!(ClientExposure::default().checked_sub_order(1, 1).is_none());
+        assert!(ClientExposure::default().checked_add_order(0, 1).is_none());
+        assert!(ClientExposure::default().checked_add_order(-1, 1).is_none());
+    }
+}
