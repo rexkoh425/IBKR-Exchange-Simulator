@@ -6,6 +6,7 @@
 //! so they do not inherit time priority.
 
 use crate::expiry::ExpirySchedule;
+use crate::risk::ClientExposure;
 use crate::session::SessionState;
 use crate::{MatchingEngine, OrderOptions, OrderRequest, RejectReason, Side, TimeInForce, Trade};
 use serde::{Deserialize, Serialize};
@@ -398,6 +399,22 @@ impl SimulatedExchange {
 
     pub fn logical_time(&self) -> u64 {
         self.expiry.now()
+    }
+
+    /// Sum remaining quantity and limit-price notional for one client's live orders.
+    /// Returns `None` if the aggregate exceeds the representable range.
+    pub fn client_exposure(&self, client_id: u64) -> Option<ClientExposure> {
+        let mut exposure = ClientExposure::default();
+        for key in self
+            .live_orders
+            .values()
+            .filter(|key| key.client_id == client_id)
+        {
+            let order = &self.orders[key];
+            let leaves = order.order_quantity_lots - order.cumulative_quantity_lots;
+            exposure = exposure.checked_add_order(order.price_ticks, leaves)?;
+        }
+        Some(exposure)
     }
 
     pub fn expiry_for_client(&self, client_id: u64, client_order_id: u64) -> Option<u64> {
