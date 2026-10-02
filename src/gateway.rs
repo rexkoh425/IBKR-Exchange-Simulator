@@ -1942,6 +1942,46 @@ mod tests {
     }
 
     #[test]
+    fn client_exposure_tracks_cross_symbol_fills_and_cancels() {
+        let mut exchange = SimulatedExchange::default();
+        exchange
+            .handle(request(
+                1,
+                1,
+                new_order_for_symbol("AAPL", 1, Side::Sell, 100, 3),
+            ))
+            .unwrap();
+        exchange
+            .handle(request(
+                1,
+                2,
+                new_order_for_symbol("MSFT", 2, Side::Sell, 200, 2),
+            ))
+            .unwrap();
+        exchange
+            .handle(request(
+                2,
+                1,
+                new_order_for_symbol("AAPL", 1, Side::Buy, 100, 1),
+            ))
+            .unwrap();
+        let exposure = exchange.client_exposure(1).unwrap();
+        assert_eq!(
+            (exposure.quantity_lots, exposure.notional_ticks_lots),
+            (4, 600)
+        );
+        exchange
+            .handle(request(1, 3, GatewayCommand::Cancel { client_order_id: 1 }))
+            .unwrap();
+        let exposure = exchange.client_exposure(1).unwrap();
+        assert_eq!(
+            (exposure.quantity_lots, exposure.notional_ticks_lots),
+            (2, 400)
+        );
+        assert_eq!(exchange.client_exposure(2), Some(ClientExposure::default()));
+    }
+
+    #[test]
     fn risk_rejected_replace_keeps_the_original_order_live() {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
