@@ -41,6 +41,8 @@ pub struct OrderStateSnapshot {
 pub struct GatewayConfig {
     pub max_order_quantity_lots: u64,
     pub max_order_notional_ticks_lots: u128,
+    pub max_client_open_quantity_lots: u128,
+    pub max_client_open_notional_ticks_lots: u128,
 }
 
 impl Default for GatewayConfig {
@@ -48,6 +50,8 @@ impl Default for GatewayConfig {
         Self {
             max_order_quantity_lots: u64::MAX,
             max_order_notional_ticks_lots: u128::MAX,
+            max_client_open_quantity_lots: u128::MAX,
+            max_client_open_notional_ticks_lots: u128::MAX,
         }
     }
 }
@@ -1924,6 +1928,7 @@ mod tests {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
             max_order_notional_ticks_lots: 500,
+            ..GatewayConfig::default()
         };
         let mut exchange = SimulatedExchange::new(config);
         let before = exchange.state_fingerprint();
@@ -1986,6 +1991,7 @@ mod tests {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
             max_order_notional_ticks_lots: 500,
+            ..GatewayConfig::default()
         };
         let mut exchange = SimulatedExchange::new(config);
         exchange

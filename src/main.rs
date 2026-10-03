@@ -36,6 +36,7 @@ fn main() {
             gateway::GatewayConfig {
                 max_order_quantity_lots,
                 max_order_notional_ticks_lots,
+                ..gateway::GatewayConfig::default()
             },
         )
         .unwrap_or_else(|error| {
@@ -99,6 +100,7 @@ fn main() {
         let config = gateway::GatewayConfig {
             max_order_quantity_lots,
             max_order_notional_ticks_lots,
+            ..gateway::GatewayConfig::default()
         };
         if let Some(path) = journal_path {
             let existing = std::fs::metadata(&path)

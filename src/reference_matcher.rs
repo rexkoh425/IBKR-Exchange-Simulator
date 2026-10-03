@@ -1414,6 +1414,7 @@ fn config() -> GatewayConfig {
     GatewayConfig {
         max_order_quantity_lots: 128,
         max_order_notional_ticks_lots: 10_000,
+        ..GatewayConfig::default()
     }
 }
 
