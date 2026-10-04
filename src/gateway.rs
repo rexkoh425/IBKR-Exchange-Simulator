@@ -120,6 +120,9 @@ pub enum OrderStatus {
 pub enum GatewayRejectReason {
     SessionClosed,
     ExpiryNotFuture,
+    ClientOpenQuantityLimit,
+    ClientOpenNotionalLimit,
+    ClientExposureOverflow,
     InvalidSymbol,
     InvalidClientOrderId,
     DuplicateClientOrderId,
@@ -1345,6 +1348,43 @@ impl SimulatedExchange {
             }
         }
         Ok(reports)
+    }
+
+    #[allow(dead_code)]
+    fn client_risk_rejection(
+        &self,
+        client_id: u64,
+        price: i64,
+        quantity: u64,
+        replacing: Option<&OrderRecord>,
+    ) -> Option<GatewayRejectReason> {
+        if self.config.max_client_open_quantity_lots == u128::MAX
+            && self.config.max_client_open_notional_ticks_lots == u128::MAX
+        {
+            return None;
+        }
+        let Some(mut exposure) = self.client_exposure(client_id) else {
+            return Some(GatewayRejectReason::ClientExposureOverflow);
+        };
+        if let Some(old) = replacing {
+            let Some(without_old) = exposure.checked_sub_order(
+                old.price_ticks,
+                old.order_quantity_lots - old.cumulative_quantity_lots,
+            ) else {
+                return Some(GatewayRejectReason::ClientExposureOverflow);
+            };
+            exposure = without_old;
+        }
+        let Some(projected) = exposure.checked_add_order(price, quantity) else {
+            return Some(GatewayRejectReason::ClientExposureOverflow);
+        };
+        if projected.quantity_lots > self.config.max_client_open_quantity_lots {
+            return Some(GatewayRejectReason::ClientOpenQuantityLimit);
+        }
+        if projected.notional_ticks_lots > self.config.max_client_open_notional_ticks_lots {
+            return Some(GatewayRejectReason::ClientOpenNotionalLimit);
+        }
+        None
     }
 
     fn risk_rejection(&self, price_ticks: i64, quantity_lots: u64) -> Option<GatewayRejectReason> {
