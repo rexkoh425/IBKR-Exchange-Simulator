@@ -1145,6 +1145,22 @@ impl ReferenceExchange {
         Ok(reports)
     }
 
+    #[allow(dead_code)]
+    fn client_exposure(&self, client_id: u64, excluded: Option<u64>) -> Option<(u128, u128)> {
+        let mut quantity = 0_u128;
+        let mut notional = 0_u128;
+        for key in self.live.values().filter(|key| key.client_id == client_id) {
+            let order = &self.orders[key];
+            if Some(order.exchange_order_id) == excluded {
+                continue;
+            }
+            let leaves = u128::from(order.quantity_lots - order.cumulative_lots);
+            quantity = quantity.checked_add(leaves)?;
+            notional = notional.checked_add((order.price_ticks as u128).checked_mul(leaves)?)?;
+        }
+        Some((quantity, notional))
+    }
+
     fn risk(&self, price_ticks: i64, quantity_lots: u64) -> Option<GatewayRejectReason> {
         if price_ticks <= 0 {
             return Some(GatewayRejectReason::Engine(RejectReason::InvalidPrice));
