@@ -1145,7 +1145,6 @@ impl ReferenceExchange {
         Ok(reports)
     }
 
-    #[allow(dead_code)]
     fn client_exposure(&self, client_id: u64, excluded: Option<u64>) -> Option<(u128, u128)> {
         let mut quantity = 0_u128;
         let mut notional = 0_u128;
@@ -1159,6 +1158,40 @@ impl ReferenceExchange {
             notional = notional.checked_add((order.price_ticks as u128).checked_mul(leaves)?)?;
         }
         Some((quantity, notional))
+    }
+
+    #[allow(dead_code)]
+    fn client_risk(
+        &self,
+        client_id: u64,
+        price: i64,
+        quantity: u64,
+        excluded: Option<u64>,
+    ) -> Option<GatewayRejectReason> {
+        if self.config.max_client_open_quantity_lots == u128::MAX
+            && self.config.max_client_open_notional_ticks_lots == u128::MAX
+        {
+            return None;
+        }
+        let Some((open_quantity, open_notional)) = self.client_exposure(client_id, excluded) else {
+            return Some(GatewayRejectReason::ClientExposureOverflow);
+        };
+        let Some(total_quantity) = open_quantity.checked_add(u128::from(quantity)) else {
+            return Some(GatewayRejectReason::ClientExposureOverflow);
+        };
+        let Some(total_notional) = (price as u128)
+            .checked_mul(u128::from(quantity))
+            .and_then(|value| open_notional.checked_add(value))
+        else {
+            return Some(GatewayRejectReason::ClientExposureOverflow);
+        };
+        if total_quantity > self.config.max_client_open_quantity_lots {
+            return Some(GatewayRejectReason::ClientOpenQuantityLimit);
+        }
+        if total_notional > self.config.max_client_open_notional_ticks_lots {
+            return Some(GatewayRejectReason::ClientOpenNotionalLimit);
+        }
+        None
     }
 
     fn risk(&self, price_ticks: i64, quantity_lots: u64) -> Option<GatewayRejectReason> {
