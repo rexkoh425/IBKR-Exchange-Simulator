@@ -750,7 +750,10 @@ impl SimulatedExchange {
                 GatewayRejectReason::InvalidSymbol,
             )]);
         }
-        if let Some(reason) = self.risk_rejection(price_ticks, quantity_lots) {
+        if let Some(reason) = self
+            .risk_rejection(price_ticks, quantity_lots)
+            .or_else(|| self.client_risk_rejection(client_id, price_ticks, quantity_lots, None))
+        {
             return Ok(vec![self.reject(
                 client_id,
                 request_id,
@@ -1103,7 +1106,9 @@ impl SimulatedExchange {
                 GatewayRejectReason::OrderNotLive,
             )]);
         }
-        if let Some(reason) = self.risk_rejection(price_ticks, quantity_lots) {
+        if let Some(reason) = self.risk_rejection(price_ticks, quantity_lots).or_else(|| {
+            self.client_risk_rejection(client_id, price_ticks, quantity_lots, Some(&old_record))
+        }) {
             return Ok(vec![self.reject(
                 client_id,
                 request_id,
@@ -1361,7 +1366,6 @@ impl SimulatedExchange {
         Ok(reports)
     }
 
-    #[allow(dead_code)]
     fn client_risk_rejection(
         &self,
         client_id: u64,

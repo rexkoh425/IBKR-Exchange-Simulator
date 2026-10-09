@@ -538,7 +538,10 @@ impl ReferenceExchange {
                 GatewayRejectReason::InvalidSymbol,
             )]);
         }
-        if let Some(reason) = self.risk(price_ticks, quantity_lots) {
+        if let Some(reason) = self
+            .risk(price_ticks, quantity_lots)
+            .or_else(|| self.client_risk(client_id, price_ticks, quantity_lots, None))
+        {
             return Ok(vec![self.reject(
                 client_id,
                 request_id,
@@ -893,7 +896,14 @@ impl ReferenceExchange {
                 GatewayRejectReason::OrderNotLive,
             )]);
         }
-        if let Some(reason) = self.risk(price_ticks, quantity_lots) {
+        if let Some(reason) = self.risk(price_ticks, quantity_lots).or_else(|| {
+            self.client_risk(
+                client_id,
+                price_ticks,
+                quantity_lots,
+                Some(old.exchange_order_id),
+            )
+        }) {
             return Ok(vec![self.reject(
                 client_id,
                 request_id,
@@ -1160,7 +1170,6 @@ impl ReferenceExchange {
         Some((quantity, notional))
     }
 
-    #[allow(dead_code)]
     fn client_risk(
         &self,
         client_id: u64,
