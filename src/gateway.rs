@@ -2035,6 +2035,43 @@ mod tests {
     }
 
     #[test]
+    fn client_quantity_limit_is_scoped_and_aggregates_symbols() {
+        let config = GatewayConfig {
+            max_client_open_quantity_lots: 5,
+            ..GatewayConfig::default()
+        };
+        let mut exchange = SimulatedExchange::new(config);
+        exchange
+            .handle(request(
+                1,
+                1,
+                new_order_for_symbol("AAPL", 1, Side::Buy, 100, 3),
+            ))
+            .unwrap();
+        let rejected = exchange
+            .handle(request(
+                1,
+                2,
+                new_order_for_symbol("MSFT", 2, Side::Sell, 200, 3),
+            ))
+            .unwrap();
+        assert_eq!(
+            rejected.reports[0].reject_reason,
+            Some(GatewayRejectReason::ClientOpenQuantityLimit)
+        );
+        let other = exchange
+            .handle(request(
+                2,
+                1,
+                new_order_for_symbol("MSFT", 1, Side::Sell, 200, 3),
+            ))
+            .unwrap();
+        assert_eq!(other.reports[0].exchange_order_id, Some(2));
+        assert_eq!(exchange.client_exposure(1).unwrap().quantity_lots, 3);
+        assert_eq!(exchange.client_exposure(2).unwrap().quantity_lots, 3);
+    }
+
+    #[test]
     fn risk_rejected_replace_keeps_the_original_order_live() {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
