@@ -2072,6 +2072,45 @@ mod tests {
     }
 
     #[test]
+    fn client_notional_limit_adds_both_sides_and_accepts_boundary() {
+        let config = GatewayConfig {
+            max_client_open_notional_ticks_lots: 500,
+            ..GatewayConfig::default()
+        };
+        let mut exchange = SimulatedExchange::new(config);
+        exchange
+            .handle(request(
+                1,
+                1,
+                new_order_for_symbol("AAPL", 1, Side::Buy, 100, 3),
+            ))
+            .unwrap();
+        let boundary = exchange
+            .handle(request(
+                1,
+                2,
+                new_order_for_symbol("MSFT", 2, Side::Sell, 100, 2),
+            ))
+            .unwrap();
+        assert_eq!(boundary.reports[0].status, OrderStatus::Accepted);
+        let rejected = exchange
+            .handle(request(
+                1,
+                3,
+                new_order_for_symbol("NVDA", 3, Side::Buy, 1, 1),
+            ))
+            .unwrap();
+        assert_eq!(
+            rejected.reports[0].reject_reason,
+            Some(GatewayRejectReason::ClientOpenNotionalLimit)
+        );
+        assert_eq!(
+            exchange.client_exposure(1).unwrap().notional_ticks_lots,
+            500
+        );
+    }
+
+    #[test]
     fn risk_rejected_replace_keeps_the_original_order_live() {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
