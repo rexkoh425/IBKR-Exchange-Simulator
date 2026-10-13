@@ -2111,6 +2111,26 @@ mod tests {
     }
 
     #[test]
+    fn partial_fills_release_client_quantity_capacity() {
+        let config = GatewayConfig {
+            max_client_open_quantity_lots: 5,
+            ..GatewayConfig::default()
+        };
+        let mut exchange = SimulatedExchange::new(config);
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 100, 5)))
+            .unwrap();
+        exchange
+            .handle(request(2, 1, new_order(1, Side::Sell, 100, 2)))
+            .unwrap();
+        let accepted = exchange
+            .handle(request(1, 2, new_order(2, Side::Buy, 99, 2)))
+            .unwrap();
+        assert_eq!(accepted.reports[0].status, OrderStatus::Accepted);
+        assert_eq!(exchange.client_exposure(1).unwrap().quantity_lots, 5);
+    }
+
+    #[test]
     fn risk_rejected_replace_keeps_the_original_order_live() {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
