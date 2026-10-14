@@ -2131,6 +2131,36 @@ mod tests {
     }
 
     #[test]
+    fn replacement_checks_net_open_exposure_and_preserves_rejected_order() {
+        let config = GatewayConfig {
+            max_client_open_quantity_lots: 5,
+            ..GatewayConfig::default()
+        };
+        let mut exchange = SimulatedExchange::new(config);
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 100, 4)))
+            .unwrap();
+        let before = exchange.book_orders();
+        let replacement = |id, quantity| GatewayCommand::Replace {
+            client_order_id: 1,
+            replacement_client_order_id: id,
+            price_ticks: 100,
+            quantity_lots: quantity,
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
+        };
+        let rejected = exchange.handle(request(1, 2, replacement(2, 6))).unwrap();
+        assert_eq!(
+            rejected.reports[0].reject_reason,
+            Some(GatewayRejectReason::ClientOpenQuantityLimit)
+        );
+        assert_eq!(exchange.book_orders(), before);
+        let accepted = exchange.handle(request(1, 3, replacement(3, 5))).unwrap();
+        assert_eq!(accepted.reports[1].status, OrderStatus::Accepted);
+        assert_eq!(exchange.client_exposure(1).unwrap().quantity_lots, 5);
+    }
+
+    #[test]
     fn risk_rejected_replace_keeps_the_original_order_live() {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
