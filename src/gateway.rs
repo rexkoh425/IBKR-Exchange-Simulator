@@ -2161,6 +2161,27 @@ mod tests {
     }
 
     #[test]
+    fn expiry_releases_client_risk_capacity() {
+        let config = GatewayConfig {
+            max_client_open_quantity_lots: 3,
+            ..GatewayConfig::default()
+        };
+        let mut exchange = SimulatedExchange::new(config);
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 100, 3)))
+            .unwrap();
+        exchange.handle(request(1, 2, set_deadline(1, 10))).unwrap();
+        exchange
+            .handle(request(0, 1, GatewayCommand::AdvanceTime { timestamp: 10 }))
+            .unwrap();
+        assert_eq!(exchange.client_exposure(1), Some(ClientExposure::default()));
+        let accepted = exchange
+            .handle(request(1, 3, new_order(2, Side::Buy, 99, 3)))
+            .unwrap();
+        assert_eq!(accepted.reports[0].status, OrderStatus::Accepted);
+    }
+
+    #[test]
     fn risk_rejected_replace_keeps_the_original_order_live() {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
