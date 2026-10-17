@@ -2182,6 +2182,36 @@ mod tests {
     }
 
     #[test]
+    fn exposure_overflow_rejects_new_orders_but_can_release_a_replacement() {
+        let mut exchange = SimulatedExchange::default();
+        for id in 1..=3 {
+            exchange
+                .handle(request(1, id, new_order(id, Side::Buy, i64::MAX, u64::MAX)))
+                .unwrap();
+        }
+        assert_eq!(exchange.client_exposure(1), None);
+        exchange.config.max_client_open_quantity_lots = u128::MAX - 1;
+        let rejected = exchange
+            .handle(request(1, 4, new_order(4, Side::Buy, 1, 1)))
+            .unwrap();
+        assert_eq!(
+            rejected.reports[0].reject_reason,
+            Some(GatewayRejectReason::ClientExposureOverflow)
+        );
+        let replacement = GatewayCommand::Replace {
+            client_order_id: 1,
+            replacement_client_order_id: 5,
+            price_ticks: 1,
+            quantity_lots: 1,
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
+        };
+        let accepted = exchange.handle(request(1, 5, replacement)).unwrap();
+        assert_eq!(accepted.reports[1].status, OrderStatus::Accepted);
+        assert!(exchange.client_exposure(1).is_some());
+    }
+
+    #[test]
     fn risk_rejected_replace_keeps_the_original_order_live() {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
