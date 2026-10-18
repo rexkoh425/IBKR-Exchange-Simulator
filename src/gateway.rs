@@ -2212,6 +2212,51 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_orders_cannot_exceed_client_limit() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        let config = GatewayConfig {
+            max_client_open_quantity_lots: 5,
+            ..GatewayConfig::default()
+        };
+        let exchange = ConcurrentSimulatedExchange::new(config);
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = (1..=2)
+            .map(|id| {
+                let exchange = exchange.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    exchange
+                        .handle(request(1, id, new_order(id, Side::Buy, 100, 4)))
+                        .unwrap()
+                })
+            })
+            .collect();
+        let responses: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.reports[0].status == OrderStatus::Accepted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.reports[0].reject_reason
+                    == Some(GatewayRejectReason::ClientOpenQuantityLimit))
+                .count(),
+            1
+        );
+        assert_eq!(exchange.snapshot().unwrap().orders.len(), 1);
+        assert!(exchange.check_invariants().is_ok());
+    }
+
+    #[test]
     fn risk_rejected_replace_keeps_the_original_order_live() {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
