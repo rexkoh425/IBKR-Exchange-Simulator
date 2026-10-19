@@ -11,6 +11,8 @@ fn main() {
         let mut output_path = None;
         let mut max_order_quantity_lots = u64::MAX;
         let mut max_order_notional_ticks_lots = u128::MAX;
+        let mut max_client_open_quantity_lots = u128::MAX;
+        let mut max_client_open_notional_ticks_lots = u128::MAX;
         let mut args = std::env::args().skip(2);
         while let Some(flag) = args.next() {
             let value = args.next().unwrap_or_else(|| usage());
@@ -22,6 +24,12 @@ fn main() {
                 }
                 "--max-order-notional" => {
                     max_order_notional_ticks_lots = value.parse().unwrap_or_else(|_| usage())
+                }
+                "--max-client-open-quantity" => {
+                    max_client_open_quantity_lots = value.parse().unwrap_or_else(|_| usage())
+                }
+                "--max-client-open-notional" => {
+                    max_client_open_notional_ticks_lots = value.parse().unwrap_or_else(|_| usage())
                 }
                 _ => usage(),
             }
@@ -36,7 +44,8 @@ fn main() {
             gateway::GatewayConfig {
                 max_order_quantity_lots,
                 max_order_notional_ticks_lots,
-                ..gateway::GatewayConfig::default()
+                max_client_open_quantity_lots,
+                max_client_open_notional_ticks_lots,
             },
         )
         .unwrap_or_else(|error| {
