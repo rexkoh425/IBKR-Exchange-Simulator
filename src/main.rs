@@ -75,6 +75,8 @@ fn main() {
         let mut summary_path = None;
         let mut max_order_quantity_lots = u64::MAX;
         let mut max_order_notional_ticks_lots = u128::MAX;
+        let mut max_client_open_quantity_lots = u128::MAX;
+        let mut max_client_open_notional_ticks_lots = u128::MAX;
         let mut journal_options = journal::JournalOptions::default();
         let mut args = std::env::args().skip(2);
         while let Some(flag) = args.next() {
@@ -88,6 +90,12 @@ fn main() {
                 }
                 "--max-order-notional" => {
                     max_order_notional_ticks_lots = value.parse().unwrap_or_else(|_| usage())
+                }
+                "--max-client-open-quantity" => {
+                    max_client_open_quantity_lots = value.parse().unwrap_or_else(|_| usage())
+                }
+                "--max-client-open-notional" => {
+                    max_client_open_notional_ticks_lots = value.parse().unwrap_or_else(|_| usage())
                 }
                 "--state-checksum-interval" => {
                     journal_options.full_state_checksum_interval =
@@ -109,7 +117,8 @@ fn main() {
         let config = gateway::GatewayConfig {
             max_order_quantity_lots,
             max_order_notional_ticks_lots,
-            ..gateway::GatewayConfig::default()
+            max_client_open_quantity_lots,
+            max_client_open_notional_ticks_lots,
         };
         if let Some(path) = journal_path {
             let existing = std::fs::metadata(&path)
