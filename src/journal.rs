@@ -680,6 +680,40 @@ mod tests {
     }
 
     #[test]
+    fn journal_replay_verifies_client_risk_decisions() {
+        let config = GatewayConfig {
+            max_client_open_quantity_lots: 5,
+            ..GatewayConfig::default()
+        };
+        let first = requests()[0].clone();
+        let mut second = first.clone();
+        second.request_id = 2;
+        if let GatewayCommand::New {
+            client_order_id,
+            quantity_lots,
+            ..
+        } = &mut second.command
+        {
+            *client_order_id = 11;
+            *quantity_lots = 1;
+        }
+        let mut bytes = Vec::new();
+        let mut journal = ExchangeJournal::new(config, &mut bytes);
+        journal.handle(first).unwrap();
+        journal.handle(second).unwrap();
+        let expected = journal.summary();
+        drop(journal);
+        assert_eq!(
+            recover(Cursor::new(&bytes), config).unwrap().summary,
+            expected
+        );
+        assert!(matches!(
+            recover(Cursor::new(bytes), GatewayConfig::default()),
+            Err(JournalError::OutcomeMismatch { line: 2 })
+        ));
+    }
+
+    #[test]
     fn journal_records_protocol_rejections_and_replays_them() {
         let mut bytes = Vec::new();
         let mut journal = ExchangeJournal::new(GatewayConfig::default(), &mut bytes);
