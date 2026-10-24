@@ -1,0 +1,4 @@
+{"client_id":1,"request_id":1,"command":{"type":"new","client_order_id":1,"symbol":"AAPL","side":"buy","price_ticks":100,"quantity_lots":3}}
+{"client_id":1,"request_id":2,"command":{"type":"new","client_order_id":2,"symbol":"MSFT","side":"buy","price_ticks":100,"quantity_lots":3}}
+{"client_id":2,"request_id":1,"command":{"type":"new","client_order_id":1,"symbol":"AAPL","side":"sell","price_ticks":100,"quantity_lots":2}}
+{"client_id":1,"request_id":3,"command":{"type":"new","client_order_id":3,"symbol":"MSFT","side":"buy","price_ticks":100,"quantity_lots":4}}
