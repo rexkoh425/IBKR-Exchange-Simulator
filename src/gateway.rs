@@ -2257,6 +2257,22 @@ mod tests {
     }
 
     #[test]
+    fn retry_at_client_limit_returns_original_response() {
+        let config = GatewayConfig {
+            max_client_open_quantity_lots: 4,
+            ..GatewayConfig::default()
+        };
+        let mut exchange = SimulatedExchange::new(config);
+        let original = request(1, 1, new_order(1, Side::Buy, 100, 4));
+        let first = exchange.handle(original.clone()).unwrap();
+        let retry = exchange.handle(original).unwrap();
+        assert!(retry.replayed);
+        assert_eq!(retry.reports, first.reports);
+        assert_eq!(exchange.client_exposure(1).unwrap().quantity_lots, 4);
+        assert_eq!(exchange.live_order_count(), 1);
+    }
+
+    #[test]
     fn risk_rejected_replace_keeps_the_original_order_live() {
         let config = GatewayConfig {
             max_order_quantity_lots: 5,
