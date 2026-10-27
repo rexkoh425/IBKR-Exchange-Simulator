@@ -1522,6 +1522,14 @@ impl ConcurrentSimulatedExchange {
             .handle(request)
     }
 
+    pub fn client_exposure(&self, client_id: u64) -> Result<Option<ClientExposure>, GatewayError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| GatewayError::LockPoisoned)?
+            .client_exposure(client_id))
+    }
+
     pub fn snapshot(&self) -> Result<ExchangeStateSnapshot, GatewayError> {
         let exchange = self.inner.lock().map_err(|_| GatewayError::LockPoisoned)?;
         Ok(ExchangeStateSnapshot {
@@ -2253,6 +2261,10 @@ mod tests {
             1
         );
         assert_eq!(exchange.snapshot().unwrap().orders.len(), 1);
+        assert_eq!(
+            exchange.client_exposure(1).unwrap().unwrap().quantity_lots,
+            4
+        );
         assert!(exchange.check_invariants().is_ok());
     }
 
