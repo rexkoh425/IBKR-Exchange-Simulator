@@ -7,6 +7,25 @@ use std::fs::File;
 use std::io::{BufRead, BufWriter, Cursor, Write};
 use std::time::Instant;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_benchmark_uses_supplied_risk_limits() {
+        let workload = frozen_workload(20, 7);
+        let unrestricted = run_gateway(&workload, 1).unwrap();
+        let config = GatewayConfig {
+            max_client_open_quantity_lots: 0,
+            ..GatewayConfig::default()
+        };
+        let restricted = run_gateway_with_config(&workload, 1, config).unwrap();
+        assert_eq!(restricted.commands, 20);
+        assert_eq!(restricted.mismatches, 0);
+        assert_ne!(restricted.state_checksum, unrestricted.state_checksum);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageResult {
     pub stage: String,
@@ -56,7 +75,15 @@ pub fn frozen_workload(commands: usize, seed: u64) -> Vec<u8> {
 }
 
 pub fn run_gateway(bytes: &[u8], trial: usize) -> Result<StageResult, String> {
-    let mut exchange = SimulatedExchange::new(GatewayConfig::default());
+    run_gateway_with_config(bytes, trial, GatewayConfig::default())
+}
+
+pub fn run_gateway_with_config(
+    bytes: &[u8],
+    trial: usize,
+    config: GatewayConfig,
+) -> Result<StageResult, String> {
+    let mut exchange = SimulatedExchange::new(config);
     let mut latencies = Vec::with_capacity(bytes.iter().filter(|byte| **byte == b'\n').count());
     let mut output = Vec::new();
     let start = Instant::now();
