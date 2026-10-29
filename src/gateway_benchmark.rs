@@ -122,9 +122,19 @@ pub fn run_journal(
     path: &std::path::Path,
     options: JournalOptions,
 ) -> Result<(StageResult, Vec<u8>), String> {
+    run_journal_with_config(bytes, trial, path, options, GatewayConfig::default())
+}
+
+pub fn run_journal_with_config(
+    bytes: &[u8],
+    trial: usize,
+    path: &std::path::Path,
+    options: JournalOptions,
+    config: GatewayConfig,
+) -> Result<(StageResult, Vec<u8>), String> {
     let file = File::create(path).map_err(|error| error.to_string())?;
     let writer = BufWriter::new(file);
-    let mut journal = ExchangeJournal::with_options(GatewayConfig::default(), writer, options);
+    let mut journal = ExchangeJournal::with_options(config, writer, options);
     let mut latencies = Vec::with_capacity(bytes.iter().filter(|byte| **byte == b'\n').count());
     let start = Instant::now();
     let mut mismatches = 0;
@@ -152,11 +162,18 @@ pub fn run_journal(
 }
 
 pub fn run_replay(journal_bytes: &[u8], trial: usize) -> Result<StageResult, String> {
+    run_replay_with_config(journal_bytes, trial, GatewayConfig::default())
+}
+
+pub fn run_replay_with_config(
+    journal_bytes: &[u8],
+    trial: usize,
+    config: GatewayConfig,
+) -> Result<StageResult, String> {
     let commands = journal_bytes.iter().filter(|byte| **byte == b'\n').count();
     let start = Instant::now();
-    let (recovered, latencies) =
-        journal::recover_profiled(Cursor::new(journal_bytes), GatewayConfig::default())
-            .map_err(|error| error.to_string())?;
+    let (recovered, latencies) = journal::recover_profiled(Cursor::new(journal_bytes), config)
+        .map_err(|error| error.to_string())?;
     let elapsed = start.elapsed();
     let mut result = finish(
         "replay",
