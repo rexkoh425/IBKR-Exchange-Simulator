@@ -196,6 +196,7 @@ fn main() {
         let mut seed = 20261110_u64;
         let mut core = None;
         let mut journal_options = journal::JournalOptions::default();
+        let mut gateway_config = gateway::GatewayConfig::default();
         let mut args = std::env::args().skip(2);
         while let Some(flag) = args.next() {
             let value = args.next().unwrap_or_else(|| usage());
@@ -204,6 +205,14 @@ fn main() {
                 "--trials" => trials = value.parse().unwrap_or_else(|_| usage()),
                 "--seed" => seed = value.parse().unwrap_or_else(|_| usage()),
                 "--core" => core = Some(value.parse::<usize>().unwrap_or_else(|_| usage())),
+                "--max-client-open-quantity" => {
+                    gateway_config.max_client_open_quantity_lots =
+                        value.parse().unwrap_or_else(|_| usage())
+                }
+                "--max-client-open-notional" => {
+                    gateway_config.max_client_open_notional_ticks_lots =
+                        value.parse().unwrap_or_else(|_| usage())
+                }
                 "--journal-checksum-interval" => {
                     journal_options.full_state_checksum_interval =
                         value.parse().unwrap_or_else(|_| usage())
@@ -224,7 +233,7 @@ fn main() {
             eprintln!("failed to pin benchmark thread to requested core {core:?}");
             std::process::exit(2);
         }
-        eprintln!("requested_core={core:?},affinity_set={affinity},commands={events},trials={trials},seed={seed},journal_checksum_interval={},journal_flush_every={},workload=frozen_new_orders_seeded_by_splitmix64", journal_options.full_state_checksum_interval, journal_options.flush_every_entries);
+        eprintln!("requested_core={core:?},affinity_set={affinity},commands={events},trials={trials},seed={seed},journal_checksum_interval={},journal_flush_every={},client_quantity_limit={},client_notional_limit={},workload=frozen_new_orders_seeded_by_splitmix64", journal_options.full_state_checksum_interval, journal_options.flush_every_entries, gateway_config.max_client_open_quantity_lots, gateway_config.max_client_open_notional_ticks_lots);
         let input = gateway_benchmark::frozen_workload(events, seed);
         let journal_path = std::env::temp_dir().join(format!(
             "exchange-bench-{}-{}.jsonl",
@@ -248,10 +257,11 @@ fn main() {
                 core_result.elapsed.as_nanos()
             );
             let mut gateway_result =
-                gateway_benchmark::run_gateway(&input, trial).unwrap_or_else(|error| {
-                    eprintln!("gateway benchmark failed: {error}");
-                    std::process::exit(1);
-                });
+                gateway_benchmark::run_gateway_with_config(&input, trial, gateway_config)
+                    .unwrap_or_else(|error| {
+                        eprintln!("gateway benchmark failed: {error}");
+                        std::process::exit(1);
+                    });
             let stable_checksum =
                 *expected_gateway_checksum.get_or_insert(gateway_result.state_checksum);
             if gateway_result.state_checksum != stable_checksum {
@@ -273,12 +283,17 @@ fn main() {
                 gateway_result.journal_bytes,
                 gateway_result.elapsed_ns
             );
-            let (mut journal_result, journal_bytes) =
-                gateway_benchmark::run_journal(&input, trial, &journal_path, journal_options)
-                    .unwrap_or_else(|error| {
-                        eprintln!("journal benchmark failed: {error}");
-                        std::process::exit(1);
-                    });
+            let (mut journal_result, journal_bytes) = gateway_benchmark::run_journal_with_config(
+                &input,
+                trial,
+                &journal_path,
+                journal_options,
+                gateway_config,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("journal benchmark failed: {error}");
+                std::process::exit(1);
+            });
             if journal_result.state_checksum != gateway_result.state_checksum {
                 journal_result.mismatches += 1;
             }
@@ -298,11 +313,12 @@ fn main() {
                 journal_result.journal_bytes,
                 journal_result.elapsed_ns
             );
-            let mut replay_result = gateway_benchmark::run_replay(&journal_bytes, trial)
-                .unwrap_or_else(|error| {
-                    eprintln!("replay benchmark failed: {error}");
-                    std::process::exit(1);
-                });
+            let mut replay_result =
+                gateway_benchmark::run_replay_with_config(&journal_bytes, trial, gateway_config)
+                    .unwrap_or_else(|error| {
+                        eprintln!("replay benchmark failed: {error}");
+                        std::process::exit(1);
+                    });
             if replay_result.state_checksum != journal_result.state_checksum {
                 replay_result.mismatches += 1;
             }
