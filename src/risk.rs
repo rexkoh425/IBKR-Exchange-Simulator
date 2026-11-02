@@ -1,11 +1,30 @@
 //! Conservative outstanding-order exposure in integer ticks and lots.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientExposure {
     pub quantity_lots: u128,
     pub notional_ticks_lots: u128,
+}
+
+/// Maintains aggregate exposure for clients with active configured limits.
+#[derive(Debug, Default)]
+pub struct ExposureLedger {
+    clients: HashMap<u64, ClientExposure>,
+}
+
+impl ExposureLedger {
+    pub fn get(&self, client_id: u64) -> ClientExposure {
+        self.clients.get(&client_id).copied().unwrap_or_default()
+    }
+
+    pub fn add(&mut self, client_id: u64, price: i64, quantity: u64) -> Option<()> {
+        let next = self.get(client_id).checked_add_order(price, quantity)?;
+        self.clients.insert(client_id, next);
+        Some(())
+    }
 }
 
 impl ClientExposure {
@@ -38,7 +57,18 @@ impl ClientExposure {
 
 #[cfg(test)]
 mod tests {
-    use super::ClientExposure;
+    use super::{ClientExposure, ExposureLedger};
+
+    #[test]
+    fn ledger_keeps_client_totals_separate_and_rejects_invalid_updates() {
+        let mut ledger = ExposureLedger::default();
+        ledger.add(1, 100, 3).unwrap();
+        ledger.add(2, 200, 2).unwrap();
+        assert!(ledger.add(1, -1, 1).is_none());
+        assert_eq!(ledger.get(1).notional_ticks_lots, 300);
+        assert_eq!(ledger.get(2).quantity_lots, 2);
+        assert_eq!(ledger.get(3), ClientExposure::default());
+    }
 
     #[test]
     fn exposure_add_and_release_preserve_quantity_and_notional() {
