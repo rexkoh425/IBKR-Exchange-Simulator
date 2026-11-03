@@ -25,6 +25,20 @@ impl ExposureLedger {
         self.clients.insert(client_id, next);
         Some(())
     }
+
+    pub fn subtract(&mut self, client_id: u64, price: i64, quantity: u64) -> Option<()> {
+        let next = self.get(client_id).checked_sub_order(price, quantity)?;
+        if next == ClientExposure::default() {
+            self.clients.remove(&client_id);
+        } else {
+            self.clients.insert(client_id, next);
+        }
+        Some(())
+    }
+
+    pub fn clients(&self) -> impl Iterator<Item = (u64, ClientExposure)> + '_ {
+        self.clients.iter().map(|(&id, &exposure)| (id, exposure))
+    }
 }
 
 impl ClientExposure {
@@ -68,6 +82,16 @@ mod tests {
         assert_eq!(ledger.get(1).notional_ticks_lots, 300);
         assert_eq!(ledger.get(2).quantity_lots, 2);
         assert_eq!(ledger.get(3), ClientExposure::default());
+    }
+
+    #[test]
+    fn ledger_removes_empty_clients_and_rejects_over_release() {
+        let mut ledger = ExposureLedger::default();
+        ledger.add(1, 100, 3).unwrap();
+        assert!(ledger.subtract(1, 100, 4).is_none());
+        assert_eq!(ledger.get(1).quantity_lots, 3);
+        ledger.subtract(1, 100, 3).unwrap();
+        assert_eq!(ledger.clients().count(), 0);
     }
 
     #[test]
