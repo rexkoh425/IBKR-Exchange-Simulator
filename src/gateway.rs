@@ -6,7 +6,7 @@
 //! so they do not inherit time priority.
 
 use crate::expiry::ExpirySchedule;
-use crate::risk::ClientExposure;
+use crate::risk::{ClientExposure, ExposureLedger};
 use crate::session::SessionState;
 use crate::{MatchingEngine, OrderOptions, OrderRequest, RejectReason, Side, TimeInForce, Trade};
 use serde::{Deserialize, Serialize};
@@ -244,6 +244,7 @@ pub struct SimulatedExchange {
     config: GatewayConfig,
     session: SessionState,
     expiry: ExpirySchedule,
+    exposure_ledger: Option<ExposureLedger>,
     engines: HashMap<String, MatchingEngine>,
     next_exchange_order_id: u64,
     next_report_sequence: u128,
@@ -265,6 +266,7 @@ impl SimulatedExchange {
             config,
             session: SessionState::Open,
             expiry: ExpirySchedule::default(),
+            exposure_ledger: None,
             engines: HashMap::new(),
             next_exchange_order_id: 0,
             next_report_sequence: 0,
@@ -446,11 +448,28 @@ impl SimulatedExchange {
     }
 
     fn insert_live_order(&mut self, exchange_id: u64, key: ClientOrderKey) {
+        if let Some(ledger) = &mut self.exposure_ledger {
+            let order = &self.orders[&key];
+            let leaves = order.order_quantity_lots - order.cumulative_quantity_lots;
+            ledger
+                .add(key.client_id, order.price_ticks, leaves)
+                .expect("risk preflight bounded exposure");
+        }
         self.live_orders.insert(exchange_id, key);
     }
 
     fn remove_live_order(&mut self, exchange_id: u64) {
-        self.live_orders.remove(&exchange_id);
+        if let Some(key) = self.live_orders.remove(&exchange_id) {
+            if let Some(ledger) = &mut self.exposure_ledger {
+                let order = &self.orders[&key];
+                let leaves = order.order_quantity_lots - order.cumulative_quantity_lots;
+                if leaves > 0 {
+                    ledger
+                        .subtract(key.client_id, order.price_ticks, leaves)
+                        .expect("live exposure is tracked");
+                }
+            }
+        }
         self.expiry.remove(exchange_id);
     }
 
@@ -2040,6 +2059,31 @@ mod tests {
             (2, 400)
         );
         assert_eq!(exchange.client_exposure(2), Some(ClientExposure::default()));
+    }
+
+    #[test]
+    fn exposure_ledger_tracks_resting_orders_and_cancels() {
+        let mut exchange = SimulatedExchange::default();
+        exchange.exposure_ledger = Some(ExposureLedger::default());
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Buy, 100, 3)))
+            .unwrap();
+        assert_eq!(
+            exchange
+                .exposure_ledger
+                .as_ref()
+                .unwrap()
+                .get(1)
+                .quantity_lots,
+            3
+        );
+        exchange
+            .handle(request(1, 2, GatewayCommand::Cancel { client_order_id: 1 }))
+            .unwrap();
+        assert_eq!(
+            exchange.exposure_ledger.as_ref().unwrap().get(1),
+            ClientExposure::default()
+        );
     }
 
     #[test]
