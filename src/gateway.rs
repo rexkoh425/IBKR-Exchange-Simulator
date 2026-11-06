@@ -1278,6 +1278,11 @@ impl SimulatedExchange {
                 .get(&trade.maker_order_id)
                 .expect("matching engine maker is represented by gateway state");
             let mut maker = self.orders[&maker_key].clone();
+            if let Some(ledger) = &mut self.exposure_ledger {
+                ledger
+                    .subtract(maker_key.client_id, maker.price_ticks, trade.quantity_lots)
+                    .expect("maker exposure is tracked");
+            }
             maker.cumulative_quantity_lots = maker
                 .cumulative_quantity_lots
                 .checked_add(trade.quantity_lots)
@@ -2079,6 +2084,30 @@ mod tests {
         );
         exchange
             .handle(request(1, 2, GatewayCommand::Cancel { client_order_id: 1 }))
+            .unwrap();
+        assert_eq!(
+            exchange.exposure_ledger.as_ref().unwrap().get(1),
+            ClientExposure::default()
+        );
+    }
+
+    #[test]
+    fn exposure_ledger_releases_maker_fills() {
+        let mut exchange = SimulatedExchange::default();
+        exchange.exposure_ledger = Some(ExposureLedger::default());
+        exchange
+            .handle(request(1, 1, new_order(1, Side::Sell, 100, 5)))
+            .unwrap();
+        exchange
+            .handle(request(2, 1, new_order(1, Side::Buy, 100, 2)))
+            .unwrap();
+        let exposure = exchange.exposure_ledger.as_ref().unwrap().get(1);
+        assert_eq!(
+            (exposure.quantity_lots, exposure.notional_ticks_lots),
+            (3, 300)
+        );
+        exchange
+            .handle(request(3, 1, new_order(1, Side::Buy, 100, 3)))
             .unwrap();
         assert_eq!(
             exchange.exposure_ledger.as_ref().unwrap().get(1),
