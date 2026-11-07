@@ -262,11 +262,13 @@ impl Default for SimulatedExchange {
 
 impl SimulatedExchange {
     pub fn new(config: GatewayConfig) -> Self {
+        let track_exposure = config.max_client_open_quantity_lots != u128::MAX
+            || config.max_client_open_notional_ticks_lots != u128::MAX;
         Self {
             config,
             session: SessionState::Open,
             expiry: ExpirySchedule::default(),
-            exposure_ledger: None,
+            exposure_ledger: track_exposure.then(ExposureLedger::default),
             engines: HashMap::new(),
             next_exchange_order_id: 0,
             next_report_sequence: 0,
@@ -421,6 +423,19 @@ impl SimulatedExchange {
         client_id: u64,
         excluded: Option<u64>,
     ) -> Option<ClientExposure> {
+        if let Some(ledger) = &self.exposure_ledger {
+            let mut exposure = ledger.get(client_id);
+            if let Some(order_id) = excluded {
+                let key = self.live_orders.get(&order_id)?;
+                if key.client_id != client_id {
+                    return None;
+                }
+                let order = &self.orders[key];
+                let leaves = order.order_quantity_lots - order.cumulative_quantity_lots;
+                exposure = exposure.checked_sub_order(order.price_ticks, leaves)?;
+            }
+            return Some(exposure);
+        }
         let mut exposure = ClientExposure::default();
         for key in self
             .live_orders
