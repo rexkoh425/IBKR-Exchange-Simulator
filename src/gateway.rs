@@ -590,6 +590,24 @@ impl SimulatedExchange {
                 return Err(format!("expiry references non-live order {order_id}"));
             }
         }
+        if let Some(ledger) = &self.exposure_ledger {
+            let mut expected: HashMap<u64, ClientExposure> = HashMap::new();
+            for key in self.live_orders.values() {
+                let order = &self.orders[key];
+                let leaves = order.order_quantity_lots - order.cumulative_quantity_lots;
+                let current = expected.entry(key.client_id).or_default();
+                *current = current
+                    .checked_add_order(order.price_ticks, leaves)
+                    .ok_or_else(|| "live exposure overflow".to_owned())?;
+            }
+            if expected.len() != ledger.clients().count()
+                || ledger
+                    .clients()
+                    .any(|(client_id, value)| expected.get(&client_id) != Some(&value))
+            {
+                return Err("client exposure ledger disagrees with live orders".into());
+            }
+        }
         for (symbol, engine) in &self.engines {
             engine
                 .check_invariants()
